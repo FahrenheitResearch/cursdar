@@ -69,7 +69,7 @@ Everything that can be GPU, is GPU. Only the network I/O and BZ2 decompression (
 - CMake 3.24+
 - Ninja build system
 
-### Build
+### Build (Windows)
 
 ```bat
 build.bat
@@ -86,13 +86,31 @@ cmake --build . -j
 
 Binary output: `build/cursdar.exe`
 
+### Build (Linux)
+
+Install dependencies:
+
+```bash
+sudo apt install build-essential cmake ninja-build libcurl4-openssl-dev
+```
+
+You also need the [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) 11.0+ installed (with `nvcc` on your PATH).
+
+Then build:
+
+```bash
+chmod +x build.sh && ./build.sh
+```
+
+Binary output: `build/cursdar`
+
 ### Dependencies (auto-fetched by CMake)
 
 - [GLFW](https://www.glfw.org/) - windowing
 - [Dear ImGui](https://github.com/ocornut/imgui) (docking branch) - UI
 - [bzip2](https://sourceware.org/bzip2/) - NEXRAD decompression
 
-No other dependencies. WinHTTP and OpenGL are built into Windows.
+Platform-provided: WinHTTP and OpenGL on Windows; libcurl, OpenGL, and pthreads on Linux.
 
 ## Data Source
 

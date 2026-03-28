@@ -5,11 +5,25 @@
 #include <windows.h>
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
+#else
+#include <curl/curl.h>
 #endif
 
 #include <cstdio>
+#include <string>
 
-// ── WinHTTP synchronous GET ─────────────────────────────────
+// ── HTTP synchronous GET (WinHTTP on Windows, libcurl on Linux) ──
+
+#ifndef _WIN32
+// libcurl write callback: appends received data to the result vector
+static size_t curlWriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+    size_t totalBytes = size * nmemb;
+    auto* vec = static_cast<std::vector<uint8_t>*>(userp);
+    const uint8_t* data = static_cast<const uint8_t*>(contents);
+    vec->insert(vec->end(), data, data + totalBytes);
+    return totalBytes;
+}
+#endif
 
 DownloadResult Downloader::httpGet(const std::string& host, const std::string& path,
                                     int port, bool https) {
@@ -124,8 +138,54 @@ DownloadResult Downloader::httpGet(const std::string& host, const std::string& p
     if (!result.success && result.error.empty()) {
         result.error = "HTTP " + std::to_string(statusCode);
     }
-#else
-    result.error = "Non-Windows not implemented (use libcurl)";
+
+#else // Linux: libcurl implementation
+
+    // Build full URL from host + path
+    std::string scheme = https ? "https" : "http";
+    std::string url = scheme + "://" + host;
+    if ((https && port != 443) || (!https && port != 80)) {
+        url += ":" + std::to_string(port);
+    }
+    url += path;
+
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        result.error = "curl_easy_init failed";
+        return result;
+    }
+
+    result.data.reserve(1024 * 1024); // 1MB initial
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "cursdar/1.0");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &result.data);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, ""); // auto decompress
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, https ? 1L : 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, https ? 2L : 0L);
+
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK) {
+        result.error = std::string("curl_easy_perform failed: ") + curl_easy_strerror(res);
+        curl_easy_cleanup(curl);
+        return result;
+    }
+
+    long httpCode = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+    result.status_code = (int)httpCode;
+
+    curl_easy_cleanup(curl);
+
+    result.success = (httpCode == 200);
+    if (!result.success && result.error.empty()) {
+        result.error = "HTTP " + std::to_string(httpCode);
+    }
+
 #endif
 
     return result;

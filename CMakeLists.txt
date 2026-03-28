@@ -87,16 +87,25 @@ add_executable(cursdar
 )
 
 target_include_directories(cursdar PRIVATE src ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-target_compile_definitions(cursdar PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 
+if(WIN32)
+    target_compile_definitions(cursdar PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
+# ── Platform-specific linking ────────────────────────────────
 target_link_libraries(cursdar PRIVATE
     imgui
     glfw
     BZip2::BZip2
-    opengl32
-    winhttp
     CUDA::cudart
 )
+
+if(WIN32)
+    target_link_libraries(cursdar PRIVATE opengl32 winhttp)
+else()
+    find_package(CURL REQUIRED)
+    target_link_libraries(cursdar PRIVATE GL CURL::libcurl dl pthread)
+endif()
 
 # CUDA settings for max performance
 set_target_properties(cursdar PROPERTIES
