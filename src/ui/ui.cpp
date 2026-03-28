@@ -7,6 +7,8 @@
 #include "../data/us_boundaries.h"
 #include <imgui.h>
 #include <cstdio>
+#include <cmath>
+#include <cstring>
 
 namespace ui {
 
@@ -83,6 +85,68 @@ void render(App& app) {
             cdl->AddCircleFilled(ImVec2(sx, sy), 2.0f, IM_COL32(200, 200, 220, 180));
             cdl->AddText(ImVec2(sx + 5, sy - 7), IM_COL32(200, 200, 220, 160),
                          US_CITIES[i].name);
+        }
+    }
+
+    // ── Range rings + azimuth lines ─────────────────────────
+    {
+        int asi = app.activeStation();
+        float slat = 0, slon = 0;
+        if (app.m_historicMode) {
+            auto* ev = app.m_historic.currentEvent();
+            if (ev) {
+                // Find station lat/lon from NEXRAD_STATIONS
+                for (int i = 0; i < NUM_NEXRAD_STATIONS; i++) {
+                    if (strcmp(NEXRAD_STATIONS[i].icao, ev->station) == 0) {
+                        slat = NEXRAD_STATIONS[i].lat;
+                        slon = NEXRAD_STATIONS[i].lon;
+                        break;
+                    }
+                }
+            }
+        } else if (asi >= 0 && asi < (int)app.stations().size()) {
+            auto& st = app.stations()[asi];
+            slat = st.gpuInfo.lat != 0 ? st.gpuInfo.lat : st.lat;
+            slon = st.gpuInfo.lon != 0 ? st.gpuInfo.lon : st.lon;
+        }
+
+        if (slat != 0 && slon != 0 && !app.showAll() && !app.mode3D()) {
+            auto* rdl = ImGui::GetBackgroundDrawList();
+            float scx = (float)((slon - vp.center_lon) * vp.zoom + vp.width * 0.5);
+            float scy = (float)((vp.center_lat - slat) * vp.zoom + vp.height * 0.5);
+            float km_per_deg = 111.0f;
+
+            // Range rings at 50km intervals
+            ImU32 ringCol = IM_COL32(60, 60, 80, 100);
+            for (int r = 50; r <= 450; r += 50) {
+                float deg = (float)r / km_per_deg;
+                float px_radius = (float)(deg * vp.zoom);
+                if (px_radius < 10 || px_radius > vp.width * 3) continue;
+                rdl->AddCircle(ImVec2(scx, scy), px_radius, ringCol, 72);
+                if (px_radius > 30) {
+                    char buf[16];
+                    snprintf(buf, sizeof(buf), "%d", r);
+                    rdl->AddText(ImVec2(scx + px_radius + 2, scy - 7),
+                                 IM_COL32(80, 80, 110, 140), buf);
+                }
+            }
+
+            // Cardinal + intercardinal azimuth lines
+            ImU32 azCol = IM_COL32(50, 50, 70, 70);
+            float maxR = 460.0f / km_per_deg * (float)vp.zoom;
+            const char* dirs[] = {"N","NE","E","SE","S","SW","W","NW"};
+            for (int d = 0; d < 8; d++) {
+                float angle = d * 45.0f * 3.14159265f / 180.0f;
+                float ex = scx + sinf(angle) * maxR;
+                float ey = scy - cosf(angle) * maxR;
+                float lw = (d % 2 == 0) ? 1.0f : 0.5f; // cardinals thicker
+                rdl->AddLine(ImVec2(scx, scy), ImVec2(ex, ey), azCol, lw);
+                float lx = scx + sinf(angle) * fminf(maxR, 60.0f);
+                float ly = scy - cosf(angle) * fminf(maxR, 60.0f);
+                if (d % 2 == 0) // only label cardinals
+                    rdl->AddText(ImVec2(lx - 4, ly - 7),
+                                 IM_COL32(100, 100, 140, 180), dirs[d]);
+            }
         }
     }
 
@@ -179,6 +243,35 @@ void render(App& app) {
     ImGui::Separator();
     if (ImGui::Button("Refresh Data", ImVec2(210, 24)))
         app.refreshData();
+
+    ImGui::Separator();
+
+    // ── SRV mode ────────────────────────────────────────────
+    if (app.activeProduct() == PROD_VEL) {
+        bool srv = app.srvMode();
+        if (ImGui::Checkbox("Storm-Relative (S)", &srv))
+            app.toggleSRV();
+        if (srv) {
+            float spd = app.stormSpeed();
+            float dir = app.stormDir();
+            ImGui::SetNextItemWidth(100);
+            if (ImGui::SliderFloat("##srvSpd", &spd, 0.0f, 40.0f, "%.0f m/s"))
+                app.setStormMotion(spd, dir);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(100);
+            if (ImGui::SliderFloat("##srvDir", &dir, 0.0f, 360.0f, "%.0f deg"))
+                app.setStormMotion(spd, dir);
+        }
+        ImGui::Separator();
+    }
+
+    // ── Detection overlays ──────────────────────────────────
+    if (ImGui::CollapsingHeader("Detection Overlays", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("TDS (Debris)", &app.m_showTDS);
+        ImGui::Checkbox("Hail (HDR)", &app.m_showHail);
+        ImGui::Checkbox("Meso/TVS", &app.m_showMeso);
+        ImGui::Checkbox("Dealiasing", &app.m_dealias);
+    }
 
     ImGui::Separator();
 
@@ -393,7 +486,62 @@ void render(App& app) {
         }
     }
 
-    // ── Cross-section line overlay ────────────────────────────
+    // ── Detection overlays (TDS, Hail, Meso) ─────────────────
+    {
+        auto* ddl = ImGui::GetBackgroundDrawList();
+        int dsi = app.activeStation();
+        if (dsi >= 0 && dsi < (int)app.stations().size()) {
+            auto& dst = app.stations()[dsi];
+            auto& det = dst.detection;
+
+            // TDS markers: white inverted triangles with red border
+            if (app.m_showTDS && !det.tds.empty()) {
+                for (auto& t : det.tds) {
+                    float sx = (float)((t.lon - vp.center_lon) * vp.zoom + vp.width * 0.5);
+                    float sy = (float)((vp.center_lat - t.lat) * vp.zoom + vp.height * 0.5);
+                    if (sx < -20 || sx > vp.width+20 || sy < -20 || sy > vp.height+20) continue;
+                    float sz = 6.0f;
+                    ddl->AddTriangleFilled(
+                        ImVec2(sx, sy + sz), ImVec2(sx - sz, sy - sz), ImVec2(sx + sz, sy - sz),
+                        IM_COL32(255, 255, 255, 200));
+                    ddl->AddTriangle(
+                        ImVec2(sx, sy + sz), ImVec2(sx - sz, sy - sz), ImVec2(sx + sz, sy - sz),
+                        IM_COL32(255, 0, 0, 255), 2.0f);
+                }
+            }
+
+            // Hail markers: green/magenta circles with H
+            if (app.m_showHail && !det.hail.empty()) {
+                for (auto& h : det.hail) {
+                    float sx = (float)((h.lon - vp.center_lon) * vp.zoom + vp.width * 0.5);
+                    float sy = (float)((vp.center_lat - h.lat) * vp.zoom + vp.height * 0.5);
+                    if (sx < -20 || sx > vp.width+20 || sy < -20 || sy > vp.height+20) continue;
+                    float r = 5.0f;
+                    ImU32 col = h.value > 10.0f ? IM_COL32(255, 50, 255, 220) :
+                                                   IM_COL32(0, 255, 100, 200);
+                    ddl->AddCircleFilled(ImVec2(sx, sy), r, col);
+                    ddl->AddText(ImVec2(sx - 3, sy - 6), IM_COL32(0, 0, 0, 255), "H");
+                }
+            }
+
+            // Mesocyclone markers: circles with rotation indicator
+            if (app.m_showMeso && !det.meso.empty()) {
+                for (auto& m : det.meso) {
+                    float sx = (float)((m.lon - vp.center_lon) * vp.zoom + vp.width * 0.5);
+                    float sy = (float)((vp.center_lat - m.lat) * vp.zoom + vp.height * 0.5);
+                    if (sx < -20 || sx > vp.width+20 || sy < -20 || sy > vp.height+20) continue;
+                    float r = m.shear > 30.0f ? 10.0f : 7.0f;
+                    ImU32 col = m.shear > 30.0f ? IM_COL32(255, 0, 0, 255) :
+                                                    IM_COL32(255, 255, 0, 255);
+                    ddl->AddCircle(ImVec2(sx, sy), r, col, 12, 2.5f);
+                    ddl->AddLine(ImVec2(sx + r, sy), ImVec2(sx + r - 3, sy - 3), col, 2.0f);
+                    ddl->AddLine(ImVec2(sx + r, sy), ImVec2(sx + r + 1, sy - 4), col, 2.0f);
+                }
+            }
+        }
+    }
+
+    // ── Cross-section line overlay ────────────────────���───────
     if (app.crossSection()) {
         auto* dl2 = ImGui::GetBackgroundDrawList();
         // Draw the cross-section line on the radar view
@@ -462,6 +610,7 @@ void render(App& app) {
         if (ImGui::IsKeyPressed(ImGuiKey_X)) app.toggleCrossSection();
         if (ImGui::IsKeyPressed(ImGuiKey_A)) app.toggleShowAll();
         if (ImGui::IsKeyPressed(ImGuiKey_R)) app.refreshData();
+        if (ImGui::IsKeyPressed(ImGuiKey_S)) app.toggleSRV();
         if (ImGui::IsKeyPressed(ImGuiKey_Home)) {
             app.viewport().center_lat = 39.0;
             app.viewport().center_lon = -98.0;

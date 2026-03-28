@@ -17,6 +17,16 @@
 
 #include "nexrad/sweep_data.h"
 
+// Detected meteorological features
+struct Detection {
+    struct Marker { float lat, lon; float value; };
+    struct MesoMarker { float lat, lon; float shear; float diameter_km; };
+    std::vector<Marker> tds;   // Tornado Debris Signature
+    std::vector<Marker> hail;  // Hail (high HDR)
+    std::vector<MesoMarker> meso; // Mesocyclone/TVS
+    bool computed = false;
+};
+
 // Per-station state
 struct StationState {
     int          index;
@@ -32,6 +42,7 @@ struct StationState {
     GpuStationInfo   gpuInfo;
     std::vector<PrecomputedSweep> precomputed; // all sweeps, ready for GPU
     std::chrono::steady_clock::time_point lastUpdate;
+    Detection detection;
 };
 
 class App {
@@ -189,5 +200,37 @@ public:
     void loadHistoricEvent(int idx);
     void uploadHistoricFrame(int frameIdx);
 
-    // (Demo packs removed)
+    // Storm-Relative Velocity mode
+    bool  m_srvMode = false;
+    float m_stormSpeed = 15.0f;  // m/s
+    float m_stormDir = 225.0f;   // degrees from north
+    void toggleSRV() { m_srvMode = !m_srvMode; }
+    bool srvMode() const { return m_srvMode; }
+    float stormSpeed() const { return m_stormSpeed; }
+    float stormDir() const { return m_stormDir; }
+    void setStormMotion(float speed, float dir) { m_stormSpeed = speed; m_stormDir = dir; }
+
+    // Detection overlays
+    bool m_showTDS = false;
+    bool m_showHail = false;
+    bool m_showMeso = false;
+
+    // All-tilt VRAM cache
+    void uploadAllTilts(int stationIdx);
+    void switchTiltCached(int stationIdx, int newTilt);
+    bool m_allTiltsCached = false;
+
+    // Detection computation
+    void computeDetection(int stationIdx);
+
+    // Velocity dealiasing
+    void dealias(int stationIdx);
+    bool m_dealias = true;
+
+    // Pre-baked animation frame cache
+    static constexpr int MAX_CACHED_FRAMES = 60;
+    uint32_t* m_cachedFrames[MAX_CACHED_FRAMES] = {};
+    int m_cachedFrameCount = 0;
+    void cacheAnimFrame(int frameIdx, const uint32_t* d_src, int w, int h);
+    bool hasCachedFrame(int frameIdx) const { return frameIdx < m_cachedFrameCount && m_cachedFrames[frameIdx]; }
 };

@@ -277,8 +277,8 @@ __device__ float sampleStation(
     const uint16_t* gd = ptrs.gates[product];
     int ri_first = (d_lo <= d_hi) ? idx_lo : idx_hi;
     int ri_second = (d_lo <= d_hi) ? idx_hi : idx_lo;
-    uint16_t raw = gd[gi * nr + ri_first];
-    if (raw <= 1) raw = gd[gi * nr + ri_second];
+    uint16_t raw = __ldg(&gd[gi * nr + ri_first]);
+    if (raw <= 1) raw = __ldg(&gd[gi * nr + ri_second]);
     if (raw <= 1) return -999.0f;
 
     float sc = info.scale[product], off = info.offset[product];
@@ -625,8 +625,8 @@ __global__ void singleStationKernel(
     int ri_first = (d_lo <= d_hi) ? idx_lo : idx_hi;
     int ri_second = (d_lo <= d_hi) ? idx_hi : idx_lo;
 
-    uint16_t raw = gates[gi * nr + ri_first];
-    if (raw <= 1) raw = gates[gi * nr + ri_second]; // fallback
+    uint16_t raw = __ldg(&gates[gi * nr + ri_first]);
+    if (raw <= 1) raw = __ldg(&gates[gi * nr + ri_second]); // fallback
     if (raw <= 1) { output[py * vp.width + px] = bg; return; }
 
     float sc = info.scale[product], off = info.offset[product];
@@ -713,6 +713,7 @@ __global__ void forwardRenderKernel(
     GpuViewport vp,
     int product, float dbz_min,
     cudaTextureObject_t colorTex,
+    float srv_speed, float srv_dir_rad, // SRV: storm motion (0 = disabled)
     uint32_t* __restrict__ output)
 {
     int ri = blockIdx.x * blockDim.x + threadIdx.x;
@@ -723,11 +724,17 @@ __global__ void forwardRenderKernel(
     if (ri >= nr || gi >= ng) return;
 
     // Early exit: empty gate (60-80% of gates skip here)
-    uint16_t raw = gates[gi * nr + ri];
+    uint16_t raw = __ldg(&gates[gi * nr + ri]);
     if (raw <= 1) return;
 
     float sc = info.scale[product], off = info.offset[product];
     float value = ((float)raw - off) / sc;
+
+    // SRV: subtract storm motion component from velocity
+    if (srv_speed > 0.0f && product == PROD_VEL) {
+        float az_rad = __ldg(&azimuths[ri]) * ((float)M_PI / 180.0f);
+        value -= srv_speed * cosf(az_rad - srv_dir_rad);
+    }
 
     // Threshold
     float threshold = dbz_min;
@@ -777,8 +784,9 @@ __global__ void forwardRenderKernel(
     // Skip if entirely off-screen
     if (ix0 > ix1 || iy0 > iy1) return;
 
-    // Edge functions for convex quad (CCW winding)
-    float2 corners[4] = {c0, c1, c2, c3};
+    // Edge functions for convex quad (CCW winding in screen space)
+    // Screen space is Y-down, so reverse order for CCW
+    float2 corners[4] = {c0, c3, c2, c1};
     float enx[4], eny[4], ed[4];
     for (int e = 0; e < 4; e++) {
         float2 v0 = corners[e];
@@ -813,7 +821,8 @@ __global__ void clearKernel(uint32_t* output, int width, int height, uint32_t co
 }
 
 void forwardRenderStation(const GpuViewport& vp, int station_idx,
-                           int product, float dbz_min, uint32_t* d_output) {
+                           int product, float dbz_min, uint32_t* d_output,
+                           float srv_speed, float srv_dir) {
     if (station_idx < 0 || station_idx >= MAX_STATIONS) return;
     auto& buf = s_stationBufs[station_idx];
     auto& info = s_stationInfo[station_idx];
@@ -830,10 +839,13 @@ void forwardRenderStation(const GpuViewport& vp, int station_idx,
     dim3 grid((info.num_radials + 31) / 32,
               (info.num_gates[product] + 7) / 8);
 
+    float srv_dir_rad = srv_dir * (float)M_PI / 180.0f;
     forwardRenderKernel<<<grid, block>>>(
         buf.d_azimuths, buf.d_gates[product],
         info, vp, product, dbz_min,
-        s_colorTextures[product], d_output);
+        s_colorTextures[product],
+        srv_speed, srv_dir_rad,
+        d_output);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
