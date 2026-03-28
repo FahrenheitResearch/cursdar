@@ -7,7 +7,8 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-static float*              d_volume_raw = nullptr;
+static float2*             d_volume_raw = nullptr;
+static float2*             d_volume_scratch = nullptr;
 static cudaArray_t         d_volume_array = nullptr;
 static cudaTextureObject_t d_volume_tex = 0;
 static bool                s_volumeReady = false;
@@ -22,6 +23,7 @@ constexpr float kRadarBeamWidthRad = 0.01745329251994329577f;
 constexpr float kHalfRadarBeamWidthRad = kRadarBeamWidthRad * 0.5f;
 constexpr float kBeamMatchTolerance = 1.35f;
 constexpr float kCrossSectionMaxHeightKm = 15.0f;
+constexpr int kVolumeSmoothPasses = 2;
 
 struct SweepDesc {
     float elevation_deg = 0.0f;
@@ -44,6 +46,10 @@ __device__ __host__ uint32_t mkRGBA(uint8_t r, uint8_t g, uint8_t b, uint8_t a =
 
 __device__ __host__ float clamp01(float v) {
     return fminf(fmaxf(v, 0.0f), 1.0f);
+}
+
+__device__ __host__ float lerpFloat(float a, float b, float t) {
+    return a + (b - a) * t;
 }
 
 __device__ __host__ bool isValidSample(float v) {
@@ -72,6 +78,8 @@ __device__ __host__ float productThreshold(int product, float reflectivity_thres
 
 __device__ __host__ bool passesThreshold(int product, float value, float reflectivity_threshold) {
     if (!isValidSample(value)) return false;
+    if (product == PROD_VEL)
+        return fabsf(value) >= fmaxf(reflectivity_threshold, 0.0f);
     return value >= productThreshold(product, reflectivity_threshold);
 }
 
@@ -93,6 +101,12 @@ __device__ __host__ int colorIndexForValue(int product, float value) {
     if (idx < 1) idx = 1;
     if (idx > 255) idx = 255;
     return idx;
+}
+
+__device__ float gaussianFalloff(float dist, float sigma) {
+    float s = fmaxf(sigma, 1e-3f);
+    float q = dist / s;
+    return expf(-0.5f * q * q);
 }
 
 __device__ int bsAz(const float* azimuths, int n, float target) {
@@ -180,24 +194,50 @@ __device__ float sampleSweepValue(const SweepDesc& sw, float azimuth_deg, float 
     return interpolate4(v00, w00, v01, w01, v10, w10, v11, w11);
 }
 
-__global__ void buildVolumeKernel(float* __restrict__ volume) {
+__device__ float sampleVolumeDensity(int product, float value, float coverage, float threshold) {
+    if (coverage <= 0.01f || !isValidSample(value) || !passesThreshold(product, value, threshold))
+        return 0.0f;
+
+    float mag = sampleMagnitude(product, value);
+    if (product == PROD_REF && threshold > kMissingValue) {
+        float gate = clamp01((value - threshold) / fmaxf(75.0f - threshold, 1.0f));
+        return powf(gate, 1.55f) * (0.15f + 0.85f * coverage);
+    }
+    if (product == PROD_CC) {
+        float cc_mag = clamp01((value - 0.3f) / 0.75f);
+        return powf(cc_mag, 1.4f) * (0.15f + 0.85f * coverage);
+    }
+    return powf(mag, 1.35f) * (0.14f + 0.86f * coverage);
+}
+
+__device__ float sampleVolumeDensityTex(cudaTextureObject_t volTex,
+                                        float tx, float ty, float tz,
+                                        int product, float threshold) {
+    float2 sample = tex3D<float2>(volTex, tx, ty, tz);
+    return sampleVolumeDensity(product, sample.x, sample.y, threshold);
+}
+
+__global__ void buildVolumeKernel(float2* __restrict__ volume, int product) {
     int vx = blockIdx.x * blockDim.x + threadIdx.x;
     int vy = blockIdx.y * blockDim.y + threadIdx.y;
     int vz = blockIdx.z;
     if (vx >= VOL_XY || vy >= VOL_XY || vz >= VOL_Z) return;
 
-    float x_km = ((float)vx / VOL_XY - 0.5f) * 2.0f * VOL_RANGE_KM;
-    float y_km = ((float)vy / VOL_XY - 0.5f) * 2.0f * VOL_RANGE_KM;
-    float z_km = ((float)vz / VOL_Z) * VOL_HEIGHT_KM;
+    float x_km = (((float)vx + 0.5f) / VOL_XY - 0.5f) * 2.0f * VOL_RANGE_KM;
+    float y_km = (((float)vy + 0.5f) / VOL_XY - 0.5f) * 2.0f * VOL_RANGE_KM;
+    float z_km = (((float)vz + 0.5f) / VOL_Z) * VOL_HEIGHT_KM;
 
     float ground_range = sqrtf(x_km * x_km + y_km * y_km);
     float azimuth = atan2f(x_km, y_km) * (180.0f / (float)M_PI);
     if (azimuth < 0.0f) azimuth += 360.0f;
 
-    float best_value0 = kMissingValue;
-    float best_value1 = kMissingValue;
-    float best_score0 = 1e30f;
-    float best_score1 = 1e30f;
+    float weighted_value = 0.0f;
+    float weight_sum = 0.0f;
+    float intensity_sum = 0.0f;
+    float footprint_sum = 0.0f;
+    float below_gap = 1e30f;
+    float above_gap = 1e30f;
+    int contrib_count = 0;
 
     for (int s = 0; s < c_numSweeps; s++) {
         const SweepDesc& sw = c_sweeps[s];
@@ -212,34 +252,134 @@ __global__ void buildVolumeKernel(float* __restrict__ volume) {
         if (!isValidSample(sample))
             continue;
 
-        float beam_offset = fabsf(beam_height - z_km);
-        float score = beam_offset / fmaxf(beam_half_width, 0.1f);
-        if (score > kBeamMatchTolerance)
+        float beam_offset = beam_height - z_km;
+        float sigma_z = fmaxf(beam_half_width * 0.85f, 0.40f);
+        float vertical_weight = gaussianFalloff(beam_offset, sigma_z);
+        if (vertical_weight < 0.025f)
             continue;
 
-        if (score < best_score0) {
-            best_score1 = best_score0;
-            best_value1 = best_value0;
-            best_score0 = score;
-            best_value0 = sample;
-        } else if (score < best_score1) {
-            best_score1 = score;
-            best_value1 = sample;
+        float mag = sampleMagnitude(product, sample);
+        float footprint_weight = 1.0f / (1.0f + beam_half_width * 0.20f);
+        float weight = vertical_weight * footprint_weight;
+        if (product == PROD_REF)
+            weight *= 0.60f + 0.40f * mag;
+
+        weighted_value += sample * weight;
+        weight_sum += weight;
+        intensity_sum += mag * weight;
+        footprint_sum += beam_half_width * weight;
+        if (beam_height <= z_km) below_gap = fminf(below_gap, z_km - beam_height);
+        else                    above_gap = fminf(above_gap, beam_height - z_km);
+        contrib_count++;
+    }
+
+    float2 out = make_float2(0.0f, 0.0f);
+    if (weight_sum > 0.02f) {
+        float value = weighted_value / weight_sum;
+        float mean_intensity = intensity_sum / weight_sum;
+        float mean_footprint = footprint_sum / weight_sum;
+
+        float bracket = 0.35f;
+        if (below_gap < 1e20f)
+            bracket += 0.25f * gaussianFalloff(below_gap, fmaxf(mean_footprint, 0.5f));
+        if (above_gap < 1e20f)
+            bracket += 0.25f * gaussianFalloff(above_gap, fmaxf(mean_footprint, 0.5f));
+        if (below_gap < 1e20f && above_gap < 1e20f)
+            bracket = fmaxf(bracket, 0.95f);
+
+        float support = clamp01(weight_sum * 0.75f);
+        float footprint_conf = 1.0f / (1.0f + fmaxf(mean_footprint - 0.75f, 0.0f) * 0.28f);
+        float coverage = (0.20f + mean_intensity * 0.80f) * support * bracket * footprint_conf;
+        if (contrib_count == 1)
+            coverage *= 0.72f;
+
+        out = make_float2(value, clamp01(coverage));
+    }
+
+    volume[(size_t)vz * VOL_XY * VOL_XY + vy * VOL_XY + vx] = out;
+}
+
+__global__ void smoothVolumeKernel(const float2* __restrict__ src,
+                                   float2* __restrict__ dst,
+                                   int product) {
+    int vx = blockIdx.x * blockDim.x + threadIdx.x;
+    int vy = blockIdx.y * blockDim.y + threadIdx.y;
+    int vz = blockIdx.z;
+    if (vx >= VOL_XY || vy >= VOL_XY || vz >= VOL_Z) return;
+
+    size_t idx = (size_t)vz * VOL_XY * VOL_XY + vy * VOL_XY + vx;
+    float2 center = src[idx];
+
+    float x_km = (((float)vx + 0.5f) / VOL_XY - 0.5f) * 2.0f * VOL_RANGE_KM;
+    float y_km = (((float)vy + 0.5f) / VOL_XY - 0.5f) * 2.0f * VOL_RANGE_KM;
+    float range_norm = clamp01(sqrtf(x_km * x_km + y_km * y_km) / VOL_RANGE_KM);
+    float sigma_xy = 0.85f + range_norm * 1.15f;
+    float sigma_z = 0.70f + range_norm * 0.65f;
+    float center_intensity =
+        (center.y > 0.01f && isValidSample(center.x)) ? sampleMagnitude(product, center.x) : 0.0f;
+
+    float sum_w = 0.0f;
+    float sum_val = 0.0f;
+    float sum_cov = 0.0f;
+    float similarity_scale = (product == PROD_REF) ? 0.07f : 0.035f;
+
+    for (int oz = -1; oz <= 1; ++oz) {
+        int nz = vz + oz;
+        if (nz < 0 || nz >= VOL_Z) continue;
+        for (int oy = -1; oy <= 1; ++oy) {
+            int ny = vy + oy;
+            if (ny < 0 || ny >= VOL_XY) continue;
+            for (int ox = -1; ox <= 1; ++ox) {
+                int nx = vx + ox;
+                if (nx < 0 || nx >= VOL_XY) continue;
+
+                float2 sample = src[(size_t)nz * VOL_XY * VOL_XY + ny * VOL_XY + nx];
+                if (sample.y <= 0.01f || !isValidSample(sample.x))
+                    continue;
+
+                float spatial =
+                    expf(-0.5f * ((ox * ox + oy * oy) / (sigma_xy * sigma_xy) +
+                                  (oz * oz) / (sigma_z * sigma_z)));
+                float similarity = 1.0f;
+                if (center.y > 0.01f && isValidSample(center.x))
+                    similarity = expf(-fabsf(sample.x - center.x) * similarity_scale);
+
+                float weight = spatial * (0.12f + 0.88f * sample.y) * similarity;
+                if (ox == 0 && oy == 0 && oz == 0)
+                    weight *= 1.35f;
+
+                sum_w += weight;
+                sum_val += sample.x * weight;
+                sum_cov += sample.y * spatial;
+            }
         }
     }
 
-    float value = kMissingValue;
-    if (isValidSample(best_value0) && isValidSample(best_value1)) {
-        float w0 = 1.0f / fmaxf(best_score0, 0.05f);
-        float w1 = 1.0f / fmaxf(best_score1, 0.05f);
-        value = (best_value0 * w0 + best_value1 * w1) / (w0 + w1);
-    } else if (isValidSample(best_value0)) {
-        value = best_value0;
-    } else if (isValidSample(best_value1)) {
-        value = best_value1;
+    if (sum_w <= 1e-5f) {
+        dst[idx] = make_float2(0.0f, 0.0f);
+        return;
     }
 
-    volume[(size_t)vz * VOL_XY * VOL_XY + vy * VOL_XY + vx] = value;
+    float filtered_val = sum_val / sum_w;
+    float filtered_cov = clamp01(sum_cov * 0.19f);
+    float smooth_mix = clamp01(0.18f + range_norm * 0.55f);
+    smooth_mix *= (1.0f - center_intensity * 0.35f);
+    if (center.y <= 0.01f || !isValidSample(center.x))
+        smooth_mix = 1.0f;
+
+    float out_val = (center.y > 0.01f && isValidSample(center.x))
+        ? lerpFloat(center.x, filtered_val, smooth_mix)
+        : filtered_val;
+    float out_cov = (center.y > 0.01f)
+        ? clamp01(fmaxf(center.y * 0.85f, center.y * 0.55f + filtered_cov * 0.45f))
+        : clamp01(filtered_cov * 0.82f);
+
+    if (out_cov < 0.015f || !isValidSample(out_val)) {
+        dst[idx] = make_float2(0.0f, 0.0f);
+        return;
+    }
+
+    dst[idx] = make_float2(out_val, out_cov);
 }
 
 __global__ void rayMarchKernel(
@@ -330,21 +470,22 @@ __global__ void rayMarchKernel(
 
     tmin = fmaxf(tmin, 0.001f);
 
-    float base_step = 0.7f;
-    int max_steps = (int)fminf((tmax - tmin) / base_step, 600.0f);
+    float base_step = 0.55f;
+    int max_steps = (int)fminf((tmax - tmin) / base_step, 720.0f);
 
-    const float lx = 0.45f;
-    const float ly = -0.35f;
-    const float lz = 0.75f;
+    const float lx = 0.34f;
+    const float ly = -0.22f;
+    const float lz = 0.91f;
     const float eps = 1.2f / VOL_XY;
 
     float3 accum = {0.0f, 0.0f, 0.0f};
     float alpha = 0.0f;
     float threshold = productThreshold(product, dbz_min);
+    float t = tmin;
+    int step = 0;
 
-    for (int step = 0; step < max_steps && alpha < 0.995f; step++) {
-        float t = tmin + (float)step * base_step;
-        if (t > tmax) break;
+    while (t <= tmax && step < max_steps && alpha < 0.995f) {
+        step++;
 
         float sx = cam_x + dx * t;
         float sy = cam_y + dy * t;
@@ -355,81 +496,99 @@ __global__ void rayMarchKernel(
 
         if (tx < 0.002f || tx > 0.998f || ty < 0.002f || ty > 0.998f ||
             tz < 0.002f || tz > 0.998f) {
+            t += base_step;
             continue;
         }
 
-        float val = tex3D<float>(volTex, tx, ty, tz);
-        if (!passesThreshold(product, val, dbz_min))
+        float2 sample = tex3D<float2>(volTex, tx, ty, tz);
+        float val = sample.x;
+        float coverage = sample.y;
+        float density = sampleVolumeDensity(product, val, coverage, threshold);
+        if (density < 0.01f) {
+            t += base_step * 1.25f;
             continue;
+        }
 
-        float gnx = tex3D<float>(volTex, tx + eps, ty, tz) - tex3D<float>(volTex, tx - eps, ty, tz);
-        float gny = tex3D<float>(volTex, tx, ty + eps, tz) - tex3D<float>(volTex, tx, ty - eps, tz);
-        float gnz = tex3D<float>(volTex, tx, ty, tz + eps) - tex3D<float>(volTex, tx, ty, tz - eps);
+        float gnx = sampleVolumeDensityTex(volTex, tx + eps, ty, tz, product, threshold) -
+                    sampleVolumeDensityTex(volTex, tx - eps, ty, tz, product, threshold);
+        float gny = sampleVolumeDensityTex(volTex, tx, ty + eps, tz, product, threshold) -
+                    sampleVolumeDensityTex(volTex, tx, ty - eps, tz, product, threshold);
+        float gnz = sampleVolumeDensityTex(volTex, tx, ty, tz + eps, product, threshold) -
+                    sampleVolumeDensityTex(volTex, tx, ty, tz - eps, product, threshold);
         float gl = rsqrtf(gnx * gnx + gny * gny + gnz * gnz + 1e-6f);
         float nx = gnx * gl;
         float ny = gny * gl;
         float nz = gnz * gl;
 
         float ndotl = fmaxf(0.0f, nx * lx + ny * ly + nz * lz);
-        float ambient = 0.25f;
-        float diffuse = 0.55f * ndotl;
+        float ambient = 0.18f;
 
         float shadow = 1.0f;
         float stx = tx;
         float sty = ty;
         float stz = tz;
-        float sl_dx = lx * eps * 3.0f;
-        float sl_dy = ly * eps * 3.0f;
-        float sl_dz = lz * (1.0f / VOL_Z) * 3.0f;
-        for (int si = 0; si < 8; si++) {
+        float sl_dx = lx * eps * 4.0f;
+        float sl_dy = ly * eps * 4.0f;
+        float sl_dz = lz * (1.0f / VOL_Z) * 4.0f;
+        for (int si = 0; si < 6; si++) {
             stx += sl_dx;
             sty += sl_dy;
             stz += sl_dz;
             if (stx < 0.0f || stx > 1.0f || sty < 0.0f || sty > 1.0f || stz < 0.0f || stz > 1.0f)
                 break;
-            float sv = tex3D<float>(volTex, stx, sty, stz);
-            if (passesThreshold(product, sv, dbz_min))
-                shadow -= sampleMagnitude(product, sv) * 0.15f;
+            float shadow_density = sampleVolumeDensityTex(volTex, stx, sty, stz, product, threshold);
+            shadow *= expf(-shadow_density * 0.45f);
         }
-        shadow = fmaxf(shadow, 0.15f);
+        shadow = fmaxf(shadow, 0.18f);
 
         float hx = lx - dx;
         float hy = ly - dy;
         float hz = lz - dz;
         float hl = rsqrtf(hx * hx + hy * hy + hz * hz + 1e-6f);
         float ndoth = fmaxf(0.0f, nx * hx * hl + ny * hy * hl + nz * hz * hl);
-        float specular = powf(ndoth, 64.0f) * 0.7f * shadow;
+        float specular = powf(ndoth, 28.0f) * 0.22f * shadow;
 
         float ndotv = fabsf(nx * (-dx) + ny * (-dy) + nz * (-dz));
-        float rim = powf(1.0f - ndotv, 3.0f) * 0.4f;
-        float lighting = ambient + diffuse * shadow + rim;
+        float rim = powf(1.0f - ndotv, 2.5f) * (0.08f + 0.22f * density);
+        float powder = 1.0f - expf(-density * 1.8f);
+        float lighting = ambient + 0.42f * ndotl * shadow + 0.25f * powder + rim;
 
         uint32_t color = c_colorTable[product][colorIndexForValue(product, val)];
         float cr = (float)(color & 0xFF) / 255.0f;
         float cg = (float)((color >> 8) & 0xFF) / 255.0f;
         float cb = (float)((color >> 16) & 0xFF) / 255.0f;
 
+        float luminance = (cr + cg + cb) / 3.0f;
+        float saturation = 0.65f + density * 0.35f;
+        cr = lerpFloat(luminance, cr, saturation);
+        cg = lerpFloat(luminance, cg, saturation);
+        cb = lerpFloat(luminance, cb, saturation);
+
         cr = cr * lighting + specular;
-        cg = cg * lighting + specular * 0.85f;
-        cb = cb * lighting + specular * 0.7f;
+        cg = cg * lighting + specular * 0.90f;
+        cb = cb * lighting + specular * 0.80f;
 
         if (product == PROD_REF) {
-            float glow = fmaxf(0.0f, (val - 45.0f) / 20.0f);
-            cr += glow * glow * 0.5f;
-            cg += glow * glow * 0.2f;
+            float glow = fmaxf(0.0f, (val - 50.0f) / 20.0f);
+            float core = glow * glow;
+            cr += core * 0.35f;
+            cg += core * 0.10f;
+            cb += core * 0.05f;
         }
 
-        float intensity = sampleMagnitude(product, val);
-        float opacity = 0.04f + powf(intensity, 2.5f) * 0.32f;
-        if (product == PROD_REF && threshold > kMissingValue) {
-            float ref_gate = clamp01((val - threshold) / fmaxf(75.0f - threshold, 1.0f));
-            opacity = 0.02f + powf(ref_gate, 2.7f) * 0.48f;
-        }
+        float forward = powf(clamp01(lx * (-dx) + ly * (-dy) + lz * (-dz)), 10.0f) * density * 0.12f;
+        cr += forward;
+        cg += forward * 0.8f;
+        cb += forward * 0.6f;
+
+        float extinction = density * ((product == PROD_REF) ? 1.6f : 1.2f);
+        float opacity = 1.0f - expf(-extinction * base_step);
 
         accum.x += (1.0f - alpha) * fminf(cr, 1.5f) * opacity;
         accum.y += (1.0f - alpha) * fminf(cg, 1.5f) * opacity;
         accum.z += (1.0f - alpha) * fminf(cb, 1.5f) * opacity;
         alpha += (1.0f - alpha) * opacity;
+        t += base_step;
     }
 
     float3 final_bg = hit_ground ? ground_color : bg;
@@ -521,10 +680,11 @@ namespace gpu {
 void initVolume() {
     freeVolume();
 
-    size_t vol_size = (size_t)VOL_XY * VOL_XY * VOL_Z * sizeof(float);
+    size_t vol_size = (size_t)VOL_XY * VOL_XY * VOL_Z * sizeof(float2);
     CUDA_CHECK(cudaMalloc(&d_volume_raw, vol_size));
+    CUDA_CHECK(cudaMalloc(&d_volume_scratch, vol_size));
 
-    cudaChannelFormatDesc desc = cudaCreateChannelDesc<float>();
+    cudaChannelFormatDesc desc = cudaCreateChannelDesc<float2>();
     cudaExtent extent = make_cudaExtent(VOL_XY, VOL_XY, VOL_Z);
     CUDA_CHECK(cudaMalloc3DArray(&d_volume_array, &desc, extent));
 
@@ -559,6 +719,10 @@ void freeVolume() {
         cudaFree(d_volume_raw);
         d_volume_raw = nullptr;
     }
+    if (d_volume_scratch) {
+        cudaFree(d_volume_scratch);
+        d_volume_scratch = nullptr;
+    }
     s_volumeReady = false;
 }
 
@@ -568,7 +732,7 @@ void buildVolume(int station_idx, int product,
                  const uint16_t* const* d_gates_per_sweep) {
     (void)station_idx;
     s_volumeReady = false;
-    if (num_sweeps <= 0 || !d_volume_raw) return;
+    if (num_sweeps <= 0 || !d_volume_raw || !d_volume_scratch) return;
 
     std::vector<SweepDesc> h_sweeps;
     h_sweeps.reserve((num_sweeps < 32) ? num_sweeps : 32);
@@ -605,11 +769,17 @@ void buildVolume(int station_idx, int product,
 
     dim3 block(8, 8);
     dim3 grid((VOL_XY + 7) / 8, (VOL_XY + 7) / 8, VOL_Z);
-    buildVolumeKernel<<<grid, block>>>(d_volume_raw);
+    buildVolumeKernel<<<grid, block>>>(d_volume_raw, product);
+    for (int pass = 0; pass < kVolumeSmoothPasses; ++pass) {
+        smoothVolumeKernel<<<grid, block>>>(
+            (pass & 1) ? d_volume_scratch : d_volume_raw,
+            (pass & 1) ? d_volume_raw : d_volume_scratch,
+            product);
+    }
     CUDA_CHECK(cudaDeviceSynchronize());
 
     cudaMemcpy3DParms copy_params = {};
-    copy_params.srcPtr = make_cudaPitchedPtr(d_volume_raw, VOL_XY * sizeof(float), VOL_XY, VOL_XY);
+    copy_params.srcPtr = make_cudaPitchedPtr(d_volume_raw, VOL_XY * sizeof(float2), VOL_XY, VOL_XY);
     copy_params.dstArray = d_volume_array;
     copy_params.extent = make_cudaExtent(VOL_XY, VOL_XY, VOL_Z);
     copy_params.kind = cudaMemcpyDeviceToDevice;
@@ -659,7 +829,7 @@ void renderVolume(const Camera3D& cam, int width, int height,
         fx, fy, fz,
         rx, ry, rz,
         ux, uy, uz,
-        0.7f, width, height, product, dbz_min, d_output);
+        0.62f, width, height, product, dbz_min, d_output);
     CUDA_CHECK(cudaGetLastError());
 }
 

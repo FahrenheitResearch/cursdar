@@ -7,11 +7,11 @@
 // Builds a voxel grid from multi-tilt radar data, then ray-marches through it.
 
 constexpr int VOL_XY = 256;
-constexpr int VOL_Z  = 64;
+constexpr int VOL_Z  = 96;
 constexpr float VOL_RANGE_KM = 230.0f;  // horizontal extent ±230km
 constexpr float VOL_HEIGHT_KM = 22.0f;  // real height 0-22km (catches tall storms)
-constexpr float VOL_Z_EXAGGERATION = 20.0f; // vertical exaggeration for display
-constexpr float VOL_DISPLAY_HEIGHT = VOL_HEIGHT_KM * VOL_Z_EXAGGERATION; // 360km rendered height
+constexpr float VOL_Z_EXAGGERATION = 10.0f; // softer vertical exaggeration for a less bowl-like volume
+constexpr float VOL_DISPLAY_HEIGHT = VOL_HEIGHT_KM * VOL_Z_EXAGGERATION;
 
 struct Camera3D {
     float orbit_angle;   // horizontal orbit (degrees, 0=north)

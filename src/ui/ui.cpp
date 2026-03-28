@@ -177,6 +177,10 @@ void render(App& app) {
     ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "%s", app.activeStationName());
     ImGui::SameLine(80);
     ImGui::Text("%s", stName);
+    if (app.snapshotMode()) {
+        ImGui::SameLine(350);
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "Snapshot: %s", app.snapshotLabel());
+    }
     }
     ImGui::SameLine(280);
     ImGui::Text("%s | Tilt %d/%d (%.1f deg)",
@@ -221,16 +225,22 @@ void render(App& app) {
     snprintf(tiltLabel, sizeof(tiltLabel), "Tilt %d/%d  (%.1f deg)",
              app.activeTilt() + 1, app.maxTilts(), app.activeTiltAngle());
     ImGui::Text("%s", tiltLabel);
+    if (app.showAll() || app.snapshotMode())
+        ImGui::TextDisabled("Mosaic uses lowest sweep per site");
     if (ImGui::Button("Tilt Up", ImVec2(100, 24))) app.nextTilt();
     ImGui::SameLine();
     if (ImGui::Button("Tilt Down", ImVec2(100, 24))) app.prevTilt();
 
     ImGui::Separator();
 
-    // dBZ threshold slider
-    ImGui::Text("Min dBZ Filter:");
+    // Product-aware threshold slider
+    bool velocityFilter = (app.activeProduct() == PROD_VEL);
+    ImGui::Text("%s", velocityFilter ? "Min |Velocity| Filter:" : "Min dBZ Filter:");
     float threshold = app.dbzMinThreshold();
-    if (ImGui::SliderFloat("##dbz", &threshold, -30.0f, 40.0f, "%.0f dBZ")) {
+    bool changed = velocityFilter
+        ? ImGui::SliderFloat("##dbz", &threshold, 0.0f, 50.0f, "%.0f m/s")
+        : ImGui::SliderFloat("##dbz", &threshold, -30.0f, 40.0f, "%.0f dBZ");
+    if (changed) {
         app.setDbzMinThreshold(threshold);
     }
 
@@ -244,6 +254,16 @@ void render(App& app) {
     ImGui::Separator();
     if (ImGui::Button("Refresh Data", ImVec2(210, 24)))
         app.refreshData();
+
+    if (!app.snapshotMode()) {
+        if (ImGui::Button("Load Mar 30 2025 5 PM ET", ImVec2(210, 24)))
+            app.loadMarch302025Snapshot();
+        if (ImGui::Button("Load Mar 30 2025 Lowest Sweep", ImVec2(210, 24)))
+            app.loadMarch302025Snapshot(true);
+    } else {
+        if (ImGui::Button("Back to Live", ImVec2(210, 24)))
+            app.refreshData();
+    }
 
     ImGui::Separator();
 

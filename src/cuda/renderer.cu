@@ -78,6 +78,13 @@ __device__ __host__ static float productThreshold(int product, float dbz_min) {
     return dbz_min;
 }
 
+__device__ __host__ static bool passesThreshold(int product, float value, float threshold) {
+    if (value <= -998.0f) return false;
+    if (product == PROD_VEL)
+        return fabsf(value) >= fmaxf(threshold, 0.0f);
+    return value >= productThreshold(product, threshold);
+}
+
 __device__ __host__ static void productColorRange(int product, float& min_val, float& max_val) {
     switch (product) {
         case PROD_REF: min_val = -30.0f; max_val = 75.0f; break;
@@ -356,10 +363,7 @@ __device__ float sampleStation(
     float sc = info.scale[product], off = info.offset[product];
     float value = ((float)raw - off) / sc;
 
-    if (value <= -998.0f) return -999.0f;
-
-    // Per-product threshold
-    if (value < productThreshold(product, dbz_min)) return -999.0f;
+    if (!passesThreshold(product, value, dbz_min)) return -999.0f;
 
     return value;
 }
@@ -772,10 +776,7 @@ __global__ void singleStationKernel(
         value -= srv_speed * cosf(az_rad - srv_dir_rad);
     }
 
-    if (value <= -998.0f) { output[py * vp.width + px] = bg; return; }
-
-    // Threshold
-    if (value < productThreshold(product, dbz_min)) { output[py * vp.width + px] = bg; return; }
+    if (!passesThreshold(product, value, dbz_min)) { output[py * vp.width + px] = bg; return; }
 
     // Color via HW texture
     float tc_coord = normalizedColorCoord(value, product);
@@ -925,7 +926,7 @@ __global__ void forwardRenderKernel(
         value -= srv_speed * cosf(az_rad - srv_dir_rad);
     }
 
-    if (value <= -998.0f || value < productThreshold(product, dbz_min)) return;
+    if (!passesThreshold(product, value, dbz_min)) return;
 
     // Color lookup
     float tc = normalizedColorCoord(value, product);

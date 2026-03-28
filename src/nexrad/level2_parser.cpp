@@ -415,17 +415,11 @@ void Level2Parser::parseMsg31(const uint8_t* data, size_t size, ParsedRadarData&
     }
 
     const float elev = roundf(radial.elevation * 10.0f) / 10.0f;
-    int refGates = 0;
-    for (const auto& m : radial.moments) {
-        if (m.product_index == 0) {
-            refGates = m.num_gates;
-            break;
-        }
-    }
+    const int sweepId = (int)hdr.elevation_number;
 
     ParsedSweep* targetSweep = nullptr;
     for (auto& s : out.sweeps) {
-        if (fabsf(s.elevation_angle - elev) < 0.15f && s.sweep_number == refGates) {
+        if (s.sweep_number == sweepId) {
             targetSweep = &s;
             break;
         }
@@ -435,7 +429,7 @@ void Level2Parser::parseMsg31(const uint8_t* data, size_t size, ParsedRadarData&
         out.sweeps.push_back({});
         targetSweep = &out.sweeps.back();
         targetSweep->elevation_angle = elev;
-        targetSweep->sweep_number = refGates;
+        targetSweep->sweep_number = sweepId;
     }
 
     targetSweep->radials.push_back(std::move(radial));
@@ -466,11 +460,8 @@ void Level2Parser::organizeSweeps(ParsedRadarData& out) {
               [](const ParsedSweep& a, const ParsedSweep& b) {
                   if (fabsf(a.elevation_angle - b.elevation_angle) > 0.05f)
                       return a.elevation_angle < b.elevation_angle;
-                  return a.sweep_number > b.sweep_number;
+                  return a.sweep_number < b.sweep_number;
               });
-
-    for (int i = 0; i < (int)out.sweeps.size(); i++)
-        out.sweeps[i].sweep_number = i;
 }
 
 ParsedRadarData Level2Parser::parse(const std::vector<uint8_t>& fileData) {

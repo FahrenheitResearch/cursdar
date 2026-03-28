@@ -114,7 +114,9 @@ public:
     void            setTilt(int t);
     int             maxTilts() const { return m_maxTilts; }
     float           activeTiltAngle() const { return m_activeTiltAngle; }
-    float           dbzMinThreshold() const { return m_dbzMinThreshold; }
+    float           dbzMinThreshold() const {
+        return (m_activeProduct == PROD_VEL) ? m_velocityMinThreshold : m_dbzMinThreshold;
+    }
     void            setDbzMinThreshold(float v);
     int             stationsLoaded() const { return m_stationsLoaded.load(); }
     int             stationsTotal() const { return m_stationsTotal; }
@@ -135,6 +137,10 @@ public:
 
     // Trigger refresh from AWS
     void refreshData();
+    void loadMarch302025Snapshot(bool lowestSweepOnly = false);
+    bool snapshotMode() const { return m_snapshotMode; }
+    const char* snapshotLabel() const { return m_snapshotLabel.c_str(); }
+    bool snapshotLowestSweepOnly() const { return m_snapshotLowestSweepOnly; }
 
 private:
     // Start downloading all active stations
@@ -153,6 +159,8 @@ private:
     void rebuildVolumeForCurrentSelection();
     bool stationUploadMatchesSelection(const StationState& st) const;
     void refreshActiveTiltMetadata();
+    void resetStationsForReload();
+    void startDownloadsForTimestamp(int year, int month, int day, int hour, int minute);
 
     Viewport         m_viewport;
     int              m_activeProduct = 0;
@@ -160,6 +168,10 @@ private:
     int              m_maxTilts = 1;
     float            m_activeTiltAngle = 0.5f;
     float            m_dbzMinThreshold = 5.0f;
+    float            m_velocityMinThreshold = 12.0f;
+    bool             m_snapshotMode = false;
+    bool             m_snapshotLowestSweepOnly = false;
+    std::string      m_snapshotLabel;
     int              m_windowWidth = 1920;
     int              m_windowHeight = 1080;
 
@@ -192,7 +204,7 @@ private:
     float m_mouseLat = 39.0f, m_mouseLon = -98.0f;
     bool  m_showAll = false;
     bool  m_mode3D = false;
-    Camera3D m_camera = {45.0f, 20.0f, 600.0f, 120.0f};
+    Camera3D m_camera = {32.0f, 24.0f, 440.0f, 54.0f};
     bool  m_volumeBuilt = false;
     int   m_volumeStation = -1;
 

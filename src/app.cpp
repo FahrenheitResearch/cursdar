@@ -16,6 +16,51 @@ constexpr float kPi = 3.14159265f;
 constexpr float kDegToRad = kPi / 180.0f;
 constexpr float kInvalidSample = -9999.0f;
 
+bool extractArchiveTime(const std::string& fname, int& hh, int& mm, int& ss) {
+    size_t us = fname.find('_');
+    if (us == std::string::npos || us + 7 > fname.size()) return false;
+    const std::string timeStr = fname.substr(us + 1, 6);
+    if (timeStr.size() != 6) return false;
+    hh = std::stoi(timeStr.substr(0, 2));
+    mm = std::stoi(timeStr.substr(2, 2));
+    ss = std::stoi(timeStr.substr(4, 2));
+    return true;
+}
+
+std::string filenameFromKey(const std::string& key) {
+    size_t slash = key.rfind('/');
+    return (slash != std::string::npos) ? key.substr(slash + 1) : key;
+}
+
+int findLowestSweepIndex(const std::vector<PrecomputedSweep>& sweeps) {
+    int bestIdx = -1;
+    float bestElev = std::numeric_limits<float>::max();
+    int bestProducts = -1;
+    int bestRadials = -1;
+
+    for (int i = 0; i < (int)sweeps.size(); i++) {
+        const auto& sw = sweeps[i];
+        if (sw.num_radials <= 0) continue;
+
+        int productCount = 0;
+        for (int p = 0; p < NUM_PRODUCTS; p++)
+            productCount += sw.products[p].has_data ? 1 : 0;
+
+        if (bestIdx < 0 ||
+            sw.elevation_angle < bestElev - 0.05f ||
+            (fabsf(sw.elevation_angle - bestElev) <= 0.05f && productCount > bestProducts) ||
+            (fabsf(sw.elevation_angle - bestElev) <= 0.05f && productCount == bestProducts &&
+             sw.num_radials > bestRadials)) {
+            bestIdx = i;
+            bestElev = sw.elevation_angle;
+            bestProducts = productCount;
+            bestRadials = sw.num_radials;
+        }
+    }
+
+    return bestIdx;
+}
+
 float decodeGateValue(const PrecomputedSweep::ProductData& pd, int num_radials,
                       int gate_idx, int radial_idx) {
     if (!pd.has_data || num_radials <= 0 ||
@@ -139,6 +184,59 @@ void clusterMesoMarkers(std::vector<Detection::MesoMarker>& markers,
         }
     }
     markers.swap(clustered);
+}
+
+void suppressReflectivityRingArtifacts(std::vector<PrecomputedSweep>& sweeps) {
+    constexpr float kCoverageStrong = 0.95f;
+    constexpr float kCoverageLoose = 0.88f;
+    constexpr float kStdStrong = 12.0f;
+    constexpr float kStdLoose = 6.0f;
+    constexpr float kMaxRangeKm = 160.0f;
+
+    for (auto& sweep : sweeps) {
+        auto& pd = sweep.products[PROD_REF];
+        if (!pd.has_data || pd.num_gates <= 0 || sweep.num_radials < 300 || pd.gates.empty())
+            continue;
+
+        const int nr = sweep.num_radials;
+        const int ng = pd.num_gates;
+        std::vector<uint8_t> suppressGate((size_t)ng, 0);
+
+        for (int gi = 0; gi < ng; ++gi) {
+            const float range_km = pd.first_gate_km + gi * pd.gate_spacing_km;
+            if (range_km > kMaxRangeKm) break;
+
+            int valid = 0;
+            float sum = 0.0f;
+            float sum2 = 0.0f;
+            for (int ri = 0; ri < nr; ++ri) {
+                uint16_t raw = pd.gates[(size_t)gi * nr + ri];
+                if (raw <= 1) continue;
+                float value = ((float)raw - pd.offset) / pd.scale;
+                valid++;
+                sum += value;
+                sum2 += value * value;
+            }
+
+            if (valid < nr / 2) continue;
+
+            const float coverage = (float)valid / (float)nr;
+            const float mean = sum / (float)valid;
+            const float variance = fmaxf(sum2 / (float)valid - mean * mean, 0.0f);
+            const float stddev = sqrtf(variance);
+
+            const bool strongRing = coverage >= kCoverageStrong && mean >= 10.0f && stddev <= kStdStrong;
+            const bool looseRing = coverage >= kCoverageLoose && mean >= 20.0f && stddev <= kStdLoose;
+            if (strongRing || looseRing)
+                suppressGate[gi] = 1;
+        }
+
+        for (int gi = 0; gi < ng; ++gi) {
+            if (!suppressGate[(size_t)gi]) continue;
+            for (int ri = 0; ri < nr; ++ri)
+                pd.gates[(size_t)gi * nr + ri] = 0;
+        }
+    }
 }
 
 } // namespace
@@ -292,6 +390,127 @@ void App::startDownloads() {
     }
 }
 
+void App::resetStationsForReload() {
+    if (m_downloader) m_downloader->shutdown();
+    m_downloader = std::make_unique<Downloader>(48);
+
+    {
+        std::lock_guard<std::mutex> lock(m_uploadMutex);
+        m_uploadQueue.clear();
+    }
+
+    for (int i = 0; i < (int)m_stations.size(); i++) {
+        gpu::freeStation(i);
+        auto& st = m_stations[i];
+        st.downloading = false;
+        st.parsed = false;
+        st.uploaded = false;
+        st.rendered = false;
+        st.failed = false;
+        st.error.clear();
+        st.parsedData = {};
+        st.gpuInfo = {};
+        st.precomputed.clear();
+        st.detection = {};
+        st.uploaded_product = -1;
+        st.uploaded_tilt = -1;
+        st.uploaded_sweep = -1;
+    }
+
+    m_stationsLoaded = 0;
+    m_stationsDownloading = 0;
+    m_gridDirty = true;
+    m_activeStationIdx = -1;
+    m_allTiltsCached = false;
+    m_activeTilt = 0;
+    m_maxTilts = 1;
+    m_activeTiltAngle = 0.5f;
+    m_volumeBuilt = false;
+    m_volumeStation = -1;
+    m_lastHistoricFrame = -1;
+    m_needsRerender = true;
+    m_needsComposite = true;
+}
+
+void App::startDownloadsForTimestamp(int year, int month, int day, int hour, int minute) {
+    const int targetSeconds = hour * 3600 + minute * 60;
+    printf("Fetching archive snapshot for %04d-%02d-%02d %02d:%02d UTC from %d stations...\n",
+           year, month, day, hour, minute, m_stationsTotal);
+
+    for (int i = 0; i < m_stationsTotal; i++) {
+        auto& st = m_stations[i];
+        if (st.downloading) continue;
+        st.downloading = true;
+        m_stationsDownloading++;
+
+        std::string station = st.icao;
+        int idx = i;
+        std::string listPath = buildListUrl(station, year, month, day);
+
+        m_downloader->queueDownload(
+            station + "_archive_list",
+            NEXRAD_HOST,
+            "/?list-type=2&prefix=" + std::string(listPath.data() + 1) + "&max-keys=1000",
+            [this, idx, station, targetSeconds](const std::string& id, DownloadResult listResult) {
+                if (!listResult.success || listResult.data.empty()) {
+                    std::lock_guard<std::mutex> lock(m_stationMutex);
+                    m_stations[idx].failed = true;
+                    m_stations[idx].error = "Archive listing failed";
+                    m_stations[idx].downloading = false;
+                    m_stationsDownloading--;
+                    return;
+                }
+
+                std::string xml(listResult.data.begin(), listResult.data.end());
+                auto files = parseS3ListResponse(xml);
+                if (files.empty()) {
+                    std::lock_guard<std::mutex> lock(m_stationMutex);
+                    m_stations[idx].failed = true;
+                    m_stations[idx].error = "No archive files found";
+                    m_stations[idx].downloading = false;
+                    m_stationsDownloading--;
+                    return;
+                }
+
+                int bestIdx = -1;
+                int bestDelta = std::numeric_limits<int>::max();
+                for (int fi = 0; fi < (int)files.size(); fi++) {
+                    int hh = 0, mm = 0, ss = 0;
+                    if (!extractArchiveTime(filenameFromKey(files[fi].key), hh, mm, ss))
+                        continue;
+                    int delta = abs((hh * 3600 + mm * 60 + ss) - targetSeconds);
+                    if (delta < bestDelta) {
+                        bestDelta = delta;
+                        bestIdx = fi;
+                    }
+                }
+
+                if (bestIdx < 0) {
+                    std::lock_guard<std::mutex> lock(m_stationMutex);
+                    m_stations[idx].failed = true;
+                    m_stations[idx].error = "No timestamped archive volume";
+                    m_stations[idx].downloading = false;
+                    m_stationsDownloading--;
+                    return;
+                }
+
+                auto fileResult = Downloader::httpGet(NEXRAD_HOST, "/" + files[bestIdx].key);
+                if (fileResult.success && !fileResult.data.empty()) {
+                    processDownload(idx, std::move(fileResult.data));
+                } else {
+                    std::lock_guard<std::mutex> lock(m_stationMutex);
+                    m_stations[idx].failed = true;
+                    m_stations[idx].error = fileResult.error.empty()
+                        ? "Archive download failed"
+                        : fileResult.error;
+                    m_stations[idx].downloading = false;
+                }
+                m_stationsDownloading--;
+            }
+        );
+    }
+}
+
 void App::processDownload(int stationIdx, std::vector<uint8_t> data) {
     // CPU: BZ2 decompression only (inherently sequential algorithm)
     auto parsed = Level2Parser::parse(data);
@@ -363,6 +582,25 @@ void App::processDownload(int stationIdx, std::vector<uint8_t> data) {
         }
     }
 
+    if (m_snapshotMode && m_snapshotLowestSweepOnly) {
+        int lowestIdx = findLowestSweepIndex(precomp);
+        if (lowestIdx >= 0) {
+            std::vector<PrecomputedSweep> reducedPrecomp;
+            reducedPrecomp.push_back(std::move(precomp[lowestIdx]));
+            precomp.swap(reducedPrecomp);
+
+            if (lowestIdx < (int)parsed.sweeps.size()) {
+                std::vector<ParsedSweep> reducedSweeps;
+                reducedSweeps.push_back(std::move(parsed.sweeps[lowestIdx]));
+                parsed.sweeps.swap(reducedSweeps);
+            }
+        }
+    }
+
+    if (m_snapshotMode) {
+        suppressReflectivityRingArtifacts(precomp);
+    }
+
     {
         std::lock_guard<std::mutex> lock(m_stationMutex);
         m_stations[stationIdx].parsedData = std::move(parsed);
@@ -417,6 +655,11 @@ static std::vector<int> getBestSweeps(const std::vector<PrecomputedSweep>& sweep
             best.push_back(c.sweepIdx);
         }
     }
+
+    std::sort(best.begin(), best.end(),
+              [&sweeps](int a, int b) {
+                  return sweeps[a].elevation_angle < sweeps[b].elevation_angle;
+              });
     return best;
 }
 
@@ -426,6 +669,25 @@ static int findProductSweep(const std::vector<PrecomputedSweep>& sweeps, int pro
     if (tiltIdx < 0) tiltIdx = 0;
     if (tiltIdx >= (int)best.size()) tiltIdx = (int)best.size() - 1;
     return best[tiltIdx];
+}
+
+static int findProductSweepNearestAngle(const std::vector<PrecomputedSweep>& sweeps,
+                                        int product, float targetAngle) {
+    auto best = getBestSweeps(sweeps, product);
+    if (best.empty()) return 0;
+
+    int bestSweep = best[0];
+    float bestDelta = fabsf(sweeps[bestSweep].elevation_angle - targetAngle);
+    for (int idx : best) {
+        float delta = fabsf(sweeps[idx].elevation_angle - targetAngle);
+        if (delta < bestDelta ||
+            (fabsf(delta - bestDelta) < 0.001f &&
+             sweeps[idx].products[product].num_gates > sweeps[bestSweep].products[product].num_gates)) {
+            bestSweep = idx;
+            bestDelta = delta;
+        }
+    }
+    return bestSweep;
 }
 
 static int countProductSweeps(const std::vector<PrecomputedSweep>& sweeps, int product) {
@@ -513,7 +775,7 @@ void App::rebuildVolumeForCurrentSelection() {
         std::vector<const uint16_t*> gatePtrs(ns);
 
         int builtSweeps = 0;
-        for (int s = 0; s < ns && s < 30; s++) {
+        for (int s = 0; s < ns && s < 32; s++) {
             const auto& pc = sweeps[s];
             int slot = 200 + s;
             if (slot >= MAX_STATIONS || pc.num_radials <= 0) break;
@@ -620,11 +882,14 @@ void App::uploadStation(int stationIdx) {
     }
     if (productTilts > m_maxTilts) m_maxTilts = productTilts;
 
-    int sweepIdx = findProductSweep(st.precomputed, m_activeProduct, m_activeTilt);
+    bool lowestSweepMosaic = m_showAll || m_snapshotMode;
+    int sweepIdx = lowestSweepMosaic
+        ? findProductSweep(st.precomputed, m_activeProduct, 0)
+        : findProductSweep(st.precomputed, m_activeProduct, m_activeTilt);
     auto& pc = st.precomputed[sweepIdx];
     if (pc.num_radials == 0) return;
 
-    if (stationIdx == m_activeStationIdx || m_activeStationIdx < 0)
+    if (!lowestSweepMosaic && (stationIdx == m_activeStationIdx || m_activeStationIdx < 0))
         m_activeTiltAngle = pc.elevation_angle;
 
     // Build GpuStationInfo from precomputed data
@@ -729,7 +994,7 @@ void App::update(float dt) {
     // Auto-refresh check
     auto now = std::chrono::steady_clock::now();
     float elapsed = std::chrono::duration<float>(now - m_lastRefresh).count();
-    if (elapsed > m_refreshIntervalSec) {
+    if (!m_snapshotMode && elapsed > m_refreshIntervalSec) {
         refreshData();
     }
 }
@@ -751,11 +1016,14 @@ void App::render() {
 
         float srvSpd = (m_srvMode && m_activeProduct == PROD_VEL) ? m_stormSpeed : 0.0f;
         float srvDir = m_stormDir;
+        float activeThreshold = (m_activeProduct == PROD_VEL)
+            ? m_velocityMinThreshold
+            : m_dbzMinThreshold;
 
         if (m_mode3D && m_volumeBuilt) {
             // 3D volumetric ray march
             gpu::renderVolume(m_camera, gpuVp.width, gpuVp.height,
-                              m_activeProduct, m_dbzMinThreshold,
+                              m_activeProduct, activeThreshold,
                               m_d_compositeOutput);
         } else if (m_historicMode) {
             int cf = m_historic.currentFrame();
@@ -766,7 +1034,7 @@ void App::render() {
                                       cudaMemcpyDeviceToDevice));
             } else {
                 gpu::renderSingleStation(gpuVp, 0,
-                                         m_activeProduct, m_dbzMinThreshold,
+                                         m_activeProduct, activeThreshold,
                                          m_d_compositeOutput, srvSpd, srvDir);
                 // Cache this rendered frame for instant replay
                 cacheAnimFrame(cf, m_d_compositeOutput, gpuVp.width, gpuVp.height);
@@ -781,7 +1049,7 @@ void App::render() {
                     gpuInfos[i] = m_stations[i].gpuInfo;
             }
             gpu::renderNative(gpuVp, gpuInfos.data(), (int)m_stations.size(),
-                              m_spatialGrid, m_activeProduct, m_dbzMinThreshold,
+                              m_spatialGrid, m_activeProduct, activeThreshold,
                               m_d_compositeOutput);
         } else if (m_activeStationIdx >= 0) {
             // Single station: fast path
@@ -790,7 +1058,7 @@ void App::render() {
                 uploadStation(m_activeStationIdx);
             }
             gpu::forwardRenderStation(gpuVp, m_activeStationIdx,
-                                      m_activeProduct, m_dbzMinThreshold,
+                                      m_activeProduct, activeThreshold,
                                       m_d_compositeOutput, srvSpd, srvDir);
         } else {
             CUDA_CHECK(cudaMemset(m_d_compositeOutput, 0x0F,
@@ -811,7 +1079,7 @@ void App::render() {
             m_xsTex.resize(m_xsWidth, m_xsHeight);
 
             gpu::renderCrossSection(
-                m_activeStationIdx, m_activeProduct, m_dbzMinThreshold,
+                m_activeStationIdx, m_activeProduct, activeThreshold,
                 m_xsStartLat, m_xsStartLon, m_xsEndLat, m_xsEndLon,
                 st.gpuInfo.lat, st.gpuInfo.lon,
                 m_xsWidth, m_xsHeight, m_d_xsOutput);
@@ -967,8 +1235,11 @@ void App::nextTilt() { setTilt(m_activeTilt + 1); }
 void App::prevTilt() { setTilt(m_activeTilt - 1); }
 
 void App::setDbzMinThreshold(float v) {
-    if (v == m_dbzMinThreshold) return;
-    m_dbzMinThreshold = v;
+    float* target = (m_activeProduct == PROD_VEL)
+        ? &m_velocityMinThreshold
+        : &m_dbzMinThreshold;
+    if (v == *target) return;
+    *target = v;
     m_needsRerender = true;
 }
 
@@ -1037,8 +1308,10 @@ void App::toggleCrossSection() {
 void App::toggle3D() {
     m_mode3D = !m_mode3D;
     m_showAll = false;
-    if (m_mode3D)
+    if (m_mode3D) {
+        m_camera = {32.0f, 24.0f, 440.0f, 54.0f};
         rebuildVolumeForCurrentSelection();
+    }
 }
 
 void App::toggleSRV() {
@@ -1060,6 +1333,9 @@ void App::rerenderAll() {
 
 void App::loadHistoricEvent(int idx) {
     m_historicMode = true;
+    m_snapshotMode = false;
+    m_snapshotLowestSweepOnly = false;
+    m_snapshotLabel.clear();
     m_lastHistoricFrame = -1;
     m_volumeBuilt = false;
     m_volumeStation = -1;
@@ -1141,6 +1417,9 @@ void App::uploadHistoricFrame(int frameIdx) {
 void App::refreshData() {
     printf("Refreshing data from AWS...\n");
     m_lastRefresh = std::chrono::steady_clock::now();
+    m_snapshotMode = false;
+    m_snapshotLowestSweepOnly = false;
+    m_snapshotLabel.clear();
 
     // Reset download states and re-download
     for (auto& st : m_stations) {
@@ -1148,6 +1427,28 @@ void App::refreshData() {
         // Don't reset parsed/uploaded - keep showing old data until new arrives
     }
     startDownloads();
+}
+
+void App::loadMarch302025Snapshot(bool lowestSweepOnly) {
+    printf("Loading all-site archive snapshot for 2025-03-30 21:00 UTC%s...\n",
+           lowestSweepOnly ? " (lowest sweep only)" : "");
+    m_lastRefresh = std::chrono::steady_clock::now();
+    m_historic.cancel();
+    m_historicMode = false;
+    m_snapshotMode = true;
+    m_snapshotLowestSweepOnly = lowestSweepOnly;
+    m_snapshotLabel = lowestSweepOnly
+        ? "Mar 30 2025 5 PM ET (Lowest Sweep)"
+        : "Mar 30 2025 5 PM ET";
+    m_showAll = true;
+    m_mode3D = false;
+    m_crossSection = false;
+    m_viewport.center_lat = 39.0;
+    m_viewport.center_lon = -98.0;
+    m_viewport.zoom = 28.0;
+    invalidateFrameCache(true);
+    resetStationsForReload();
+    startDownloadsForTimestamp(2025, 3, 30, 21, 0);
 }
 
 // ── Detection computation (TDS, Hail, Mesocyclone) ──────────

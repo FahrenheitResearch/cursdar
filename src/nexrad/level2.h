@@ -167,7 +167,7 @@ struct ParsedRadial {
 
 struct ParsedSweep {
     float elevation_angle;
-    int   sweep_number;
+    int   sweep_number;          // Message 31 elevation_number (cut index within volume)
     std::vector<ParsedRadial> radials; // sorted by azimuth
 };
 
