@@ -82,6 +82,10 @@ void forwardRenderStation(const GpuViewport& vp,
 
 void syncStation(int station_idx);
 
+// Swap device pointers for a station (for instant tilt switching from VRAM cache)
+void swapStationPointers(int station_idx, const GpuStationInfo& info,
+                          float* d_azimuths, uint16_t* d_gates[NUM_PRODUCTS]);
+
 // Get device pointers for a station's data
 float*    getStationAzimuths(int station_idx);
 uint16_t* getStationGates(int station_idx, int product);

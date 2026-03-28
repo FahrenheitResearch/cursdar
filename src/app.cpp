@@ -59,6 +59,7 @@ bool App::init(int windowWidth, int windowHeight) {
     startDownloads();
 
     gpu::initVolume();
+    m_warnings.startPolling();
     m_lastRefresh = std::chrono::steady_clock::now();
 
     printf("App initialized: %d stations, viewport %dx%d\n",

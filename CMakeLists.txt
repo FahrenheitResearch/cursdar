@@ -80,6 +80,7 @@ add_executable(cursdar
     src/historic.cpp
     src/nexrad/level2_parser.cpp
     src/net/downloader.cpp
+    src/net/warnings.cpp
     src/render/gl_interop.cpp
     src/ui/ui.cpp
     src/cuda/renderer.cu

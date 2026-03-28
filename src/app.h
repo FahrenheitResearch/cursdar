@@ -6,6 +6,7 @@
 #include "render/projection.h"
 #include "cuda/volume3d.cuh"
 #include "net/downloader.h"
+#include "net/warnings.h"
 #include "historic.h"
 #include <vector>
 #include <string>
@@ -175,6 +176,10 @@ private:
     // Auto-refresh timer
     std::chrono::steady_clock::time_point m_lastRefresh;
     float m_refreshIntervalSec = 300.0f;
+
+public:
+    // NWS warning overlay
+    WarningFetcher m_warnings;
 
 public:
     // Historic event viewer

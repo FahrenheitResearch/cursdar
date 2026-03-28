@@ -3,6 +3,8 @@
 #include "../nexrad/products.h"
 #include "../nexrad/stations.h"
 #include "../historic.h"
+#include "../net/warnings.h"
+#include "../data/us_boundaries.h"
 #include <imgui.h>
 #include <cstdio>
 
@@ -42,6 +44,47 @@ void render(App& app) {
         (ImTextureID)(uintptr_t)app.outputTexture().textureId(),
         ImVec2(0, 0),
         ImVec2((float)vp.width, (float)vp.height));
+
+    // ── State boundaries ─────────────────────────────────────
+    {
+        auto* bdl = ImGui::GetBackgroundDrawList();
+        ImU32 lineCol = IM_COL32(50, 50, 70, 140);
+        for (int i = 0; i < US_STATE_LINE_COUNT; i++) {
+            float lat1 = US_STATE_LINES[i*4+0], lon1 = US_STATE_LINES[i*4+1];
+            float lat2 = US_STATE_LINES[i*4+2], lon2 = US_STATE_LINES[i*4+3];
+            float sx1 = (float)((lon1 - vp.center_lon) * vp.zoom + vp.width * 0.5);
+            float sy1 = (float)((vp.center_lat - lat1) * vp.zoom + vp.height * 0.5);
+            float sx2 = (float)((lon2 - vp.center_lon) * vp.zoom + vp.width * 0.5);
+            float sy2 = (float)((vp.center_lat - lat2) * vp.zoom + vp.height * 0.5);
+            // Coarse viewport cull
+            if (sx1 < -50 && sx2 < -50) continue;
+            if (sx1 > vp.width+50 && sx2 > vp.width+50) continue;
+            if (sy1 < -50 && sy2 < -50) continue;
+            if (sy1 > vp.height+50 && sy2 > vp.height+50) continue;
+            bdl->AddLine(ImVec2(sx1,sy1), ImVec2(sx2,sy2), lineCol, 1.0f);
+        }
+    }
+
+    // ── City labels (zoom-dependent) ────────────────────────
+    {
+        auto* cdl = ImGui::GetBackgroundDrawList();
+        // Determine population threshold based on zoom
+        int popThreshold = 1000000;  // very zoomed out: only mega cities
+        if (vp.zoom > 40) popThreshold = 500000;
+        if (vp.zoom > 80) popThreshold = 200000;
+        if (vp.zoom > 150) popThreshold = 100000;
+        if (vp.zoom > 300) popThreshold = 50000;
+
+        for (int i = 0; i < US_CITY_COUNT; i++) {
+            if (US_CITIES[i].population < popThreshold) continue;
+            float sx = (float)((US_CITIES[i].lon - vp.center_lon) * vp.zoom + vp.width * 0.5);
+            float sy = (float)((vp.center_lat - US_CITIES[i].lat) * vp.zoom + vp.height * 0.5);
+            if (sx < -50 || sx > vp.width+50 || sy < -50 || sy > vp.height+50) continue;
+            cdl->AddCircleFilled(ImVec2(sx, sy), 2.0f, IM_COL32(200, 200, 220, 180));
+            cdl->AddText(ImVec2(sx + 5, sy - 7), IM_COL32(200, 200, 220, 160),
+                         US_CITIES[i].name);
+        }
+    }
 
     // ── Status bar (top) ────────────────────────────────────
     ImGui::SetNextWindowPos(ImVec2(0, 0));
@@ -315,6 +358,40 @@ void render(App& app) {
         }
     }
     skip_station_markers:
+
+    // ── NWS Warning Polygons ────────────────────────────────
+    if (!app.m_historicMode) {
+        auto* wdl = ImGui::GetBackgroundDrawList();
+        auto warnings = app.m_warnings.getWarnings();
+        for (auto& w : warnings) {
+            if (w.lats.size() < 3) continue;
+            // Convert polygon to screen coordinates and draw
+            std::vector<ImVec2> pts;
+            pts.reserve(w.lats.size());
+            bool anyOnScreen = false;
+            for (int i = 0; i < (int)w.lats.size(); i++) {
+                float sx = (float)((w.lons[i] - vp.center_lon) * vp.zoom + vp.width * 0.5);
+                float sy = (float)((vp.center_lat - w.lats[i]) * vp.zoom + vp.height * 0.5);
+                pts.push_back(ImVec2(sx, sy));
+                if (sx > -100 && sx < vp.width + 100 && sy > -100 && sy < vp.height + 100)
+                    anyOnScreen = true;
+            }
+            if (!anyOnScreen) continue;
+
+            // Draw filled polygon (semi-transparent)
+            uint32_t fillCol = w.color;
+            if (pts.size() >= 3) {
+                // ImGui convex fill - warnings are typically convex
+                wdl->AddConvexPolyFilled(pts.data(), (int)pts.size(), fillCol);
+            }
+            // Draw outline
+            uint32_t outlineCol = fillCol | 0xFF000000; // full alpha
+            for (int i = 0; i < (int)pts.size(); i++) {
+                int j = (i + 1) % (int)pts.size();
+                wdl->AddLine(pts[i], pts[j], outlineCol, w.line_width);
+            }
+        }
+    }
 
     // ── Cross-section line overlay ────────────────────────────
     if (app.crossSection()) {

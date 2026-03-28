@@ -487,17 +487,31 @@ void uploadStationData(int idx, const GpuStationInfo& info,
 
     s_stationInfo[idx] = info;
 
-    CUDA_CHECK(cudaMemcpyAsync(buf.d_azimuths, azimuths,
-                                info.num_radials * sizeof(float),
+    // Use pinned staging buffer for TRUE async transfer (2x bandwidth)
+    // Without pinned memory, cudaMemcpyAsync silently blocks.
+    size_t az_size = info.num_radials * sizeof(float);
+    float* pinned_az;
+    CUDA_CHECK(cudaMallocHost(&pinned_az, az_size));
+    memcpy(pinned_az, azimuths, az_size);
+    CUDA_CHECK(cudaMemcpyAsync(buf.d_azimuths, pinned_az, az_size,
                                 cudaMemcpyHostToDevice, buf.stream));
 
+    uint8_t* pinned_gates[NUM_PRODUCTS] = {};
     for (int p = 0; p < NUM_PRODUCTS; p++) {
         if (info.has_product[p] && gate_data[p] && buf.d_gates[p]) {
             size_t sz = (size_t)info.num_gates[p] * info.num_radials * sizeof(uint16_t);
-            CUDA_CHECK(cudaMemcpyAsync(buf.d_gates[p], gate_data[p], sz,
+            CUDA_CHECK(cudaMallocHost(&pinned_gates[p], sz));
+            memcpy(pinned_gates[p], gate_data[p], sz);
+            CUDA_CHECK(cudaMemcpyAsync(buf.d_gates[p], pinned_gates[p], sz,
                                         cudaMemcpyHostToDevice, buf.stream));
         }
     }
+
+    // Sync then free pinned staging buffers
+    CUDA_CHECK(cudaStreamSynchronize(buf.stream));
+    cudaFreeHost(pinned_az);
+    for (int p = 0; p < NUM_PRODUCTS; p++)
+        if (pinned_gates[p]) cudaFreeHost(pinned_gates[p]);
 
     h_stationPtrs[idx].azimuths = buf.d_azimuths;
     for (int p = 0; p < NUM_PRODUCTS; p++)
@@ -829,6 +843,22 @@ void forwardRenderStation(const GpuViewport& vp, int station_idx,
 void syncStation(int idx) {
     if (idx >= 0 && idx < MAX_STATIONS && s_stationBufs[idx].allocated)
         CUDA_CHECK(cudaStreamSynchronize(s_stationBufs[idx].stream));
+}
+
+// Instant tilt switch: swap device pointers without re-uploading data
+void swapStationPointers(int idx, const GpuStationInfo& info,
+                          float* d_az, uint16_t* d_g[NUM_PRODUCTS]) {
+    if (idx < 0 || idx >= MAX_STATIONS) return;
+    s_stationInfo[idx] = info;
+    if (s_stationBufs[idx].allocated) {
+        // Don't free old pointers - they're in the VRAM cache
+        s_stationBufs[idx].d_azimuths = d_az;
+        for (int p = 0; p < NUM_PRODUCTS; p++)
+            s_stationBufs[idx].d_gates[p] = d_g[p];
+    }
+    h_stationPtrs[idx].azimuths = d_az;
+    for (int p = 0; p < NUM_PRODUCTS; p++)
+        h_stationPtrs[idx].gates[p] = d_g[p];
 }
 
 float* getStationAzimuths(int idx) {
