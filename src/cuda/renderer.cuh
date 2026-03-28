@@ -67,11 +67,18 @@ void renderNative(const GpuViewport& vp,
                   int product, float dbz_min_threshold,
                   uint32_t* d_output);
 
-// Single-station native-res render (FAST - no spatial grid, no station loop)
+// Single-station native-res render (inverse mapping)
 void renderSingleStation(const GpuViewport& vp,
                           int station_idx,
                           int product, float dbz_min_threshold,
                           uint32_t* d_output);
+
+// Forward render: one thread per gate, rasterizes polar quads directly.
+// Skips empty gates entirely. Crisp per-gate rendering by construction.
+void forwardRenderStation(const GpuViewport& vp,
+                           int station_idx,
+                           int product, float dbz_min_threshold,
+                           uint32_t* d_output);
 
 void syncStation(int station_idx);
 

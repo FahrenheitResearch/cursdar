@@ -332,8 +332,6 @@ __global__ void nativeRenderKernel(
     int count = grid->counts[gy][gx];
     float best_value = -999.0f;
     float best_range = 1e9f;
-    int   best_product_idx = -1;
-    GpuStationInfo best_info;
 
     // Check each station in this cell
     for (int ci = 0; ci < count; ci++) {
@@ -341,16 +339,14 @@ __global__ void nativeRenderKernel(
         if (si < 0 || si >= num_stations) continue;
 
         const auto& info = stations[si];
-        float slat = info.lat, slon = info.lon;
 
         // Distance in km (flat earth approx, good for <500km)
-        float dlat_km = (lat - slat) * 111.0f;
-        float dlon_km = (lon - slon) * 111.0f * cosf(slat * (float)M_PI / 180.0f);
+        float dlat_km = (lat - info.lat) * 111.0f;
+        float dlon_km = (lon - info.lon) * 111.0f * cosf(info.lat * (float)M_PI / 180.0f);
         float range_km = sqrtf(dlat_km * dlat_km + dlon_km * dlon_km);
 
         if (range_km > 460.0f) continue;
 
-        // Azimuth from station to pixel
         float az = atan2f(dlon_km, dlat_km) * (180.0f / (float)M_PI);
         if (az < 0.0f) az += 360.0f;
 
@@ -358,7 +354,6 @@ __global__ void nativeRenderKernel(
         if (val > -998.0f && range_km < best_range) {
             best_value = val;
             best_range = range_km;
-            best_info = info;
         }
     }
 
@@ -530,8 +525,8 @@ void renderNative(const GpuViewport& vp,
     CUDA_CHECK(cudaMemcpy(d_stationPtrsBuf, h_stationPtrs,
                            num_stations * sizeof(GpuStationPtrs), cudaMemcpyHostToDevice));
 
-    dim3 block(16, 16);
-    dim3 grid_dim((vp.width + 15) / 16, (vp.height + 15) / 16);
+    dim3 block(32, 8);
+    dim3 grid_dim((vp.width + 31) / 32, (vp.height + 7) / 8);
 
     nativeRenderKernel<<<grid_dim, block>>>(
         vp, d_stationInfoBuf, d_stationPtrsBuf, num_stations,
@@ -677,6 +672,158 @@ void renderSingleStation(const GpuViewport& vp, int station_idx,
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
         fprintf(stderr, "Single station render error: %s\n", cudaGetErrorString(err));
+}
+
+// ── Forward Render Kernel ────────────────────────────────────
+// One thread per gate cell. Computes 4 screen-space corners of the polar
+// quad, fills all pixels inside with the gate's color. Empty gates skip
+// immediately. Crisp per-gate rendering by construction.
+
+__device__ float2 polarToScreen(float range_km, float az_rad,
+                                 float slat, float slon,
+                                 const GpuViewport& vp) {
+    float cos_lat = cosf(slat * (float)M_PI / 180.0f);
+    float east_km = range_km * sinf(az_rad);
+    float north_km = range_km * cosf(az_rad);
+    float lon_off = east_km / (111.0f * cos_lat);
+    float lat_off = north_km / 111.0f;
+    float px = ((slon + lon_off) - vp.center_lon) / vp.deg_per_pixel_x + vp.width * 0.5f;
+    float py = (vp.center_lat - (slat + lat_off)) / vp.deg_per_pixel_y + vp.height * 0.5f;
+    return make_float2(px, py);
+}
+
+__global__ void forwardRenderKernel(
+    const float* __restrict__ azimuths,
+    const uint16_t* __restrict__ gates,
+    GpuStationInfo info,
+    GpuViewport vp,
+    int product, float dbz_min,
+    cudaTextureObject_t colorTex,
+    uint32_t* __restrict__ output)
+{
+    int ri = blockIdx.x * blockDim.x + threadIdx.x;
+    int gi = blockIdx.y * blockDim.y + threadIdx.y;
+
+    int nr = info.num_radials;
+    int ng = info.num_gates[product];
+    if (ri >= nr || gi >= ng) return;
+
+    // Early exit: empty gate (60-80% of gates skip here)
+    uint16_t raw = gates[gi * nr + ri];
+    if (raw <= 1) return;
+
+    float sc = info.scale[product], off = info.offset[product];
+    float value = ((float)raw - off) / sc;
+
+    // Threshold
+    float threshold = dbz_min;
+    if (product == PROD_VEL || product == PROD_ZDR || product == PROD_KDP || product == PROD_PHI)
+        threshold = -999.0f;
+    else if (product == PROD_CC) threshold = 0.3f;
+    else if (product == PROD_SW) threshold = 0.5f;
+    if (value < threshold) return;
+
+    // Color lookup
+    float min_val, max_val;
+    switch (product) {
+        case PROD_REF: min_val=-30;max_val=75; break;
+        case PROD_VEL: min_val=-64;max_val=64; break;
+        case PROD_SW:  min_val=0;max_val=30; break;
+        case PROD_ZDR: min_val=-8;max_val=8; break;
+        case PROD_CC:  min_val=0.2f;max_val=1.05f; break;
+        case PROD_KDP: min_val=-10;max_val=15; break;
+        default:       min_val=0;max_val=360; break;
+    }
+    float norm = fminf(fmaxf((value - min_val) / (max_val - min_val), 0.0f), 1.0f);
+    float tc = (norm * 254.0f + 1.0f) / 256.0f;
+    float4 col = tex1D<float4>(colorTex, tc);
+    if (col.w < 0.01f) return;
+    uint32_t rgba = makeRGBA((uint8_t)(col.x*255), (uint8_t)(col.y*255),
+                              (uint8_t)(col.z*255), 255);
+
+    // Compute 4 corners of this polar quad in screen space
+    int ri_next = (ri + 1) % nr;
+    float az0 = azimuths[ri] * ((float)M_PI / 180.0f);
+    float az1 = azimuths[ri_next] * ((float)M_PI / 180.0f);
+    float gskm = info.gate_spacing_km[product];
+    float r0 = info.first_gate_km[product] + gi * gskm;
+    float r1 = r0 + gskm;
+
+    float2 c0 = polarToScreen(r0, az0, info.lat, info.lon, vp);
+    float2 c1 = polarToScreen(r1, az0, info.lat, info.lon, vp);
+    float2 c2 = polarToScreen(r1, az1, info.lat, info.lon, vp);
+    float2 c3 = polarToScreen(r0, az1, info.lat, info.lon, vp);
+
+    // Bounding box (clipped to viewport)
+    int ix0 = max(0, (int)floorf(fminf(fminf(c0.x, c1.x), fminf(c2.x, c3.x))));
+    int ix1 = min(vp.width - 1, (int)ceilf(fmaxf(fmaxf(c0.x, c1.x), fmaxf(c2.x, c3.x))));
+    int iy0 = max(0, (int)floorf(fminf(fminf(c0.y, c1.y), fminf(c2.y, c3.y))));
+    int iy1 = min(vp.height - 1, (int)ceilf(fmaxf(fmaxf(c0.y, c1.y), fmaxf(c2.y, c3.y))));
+
+    // Skip if entirely off-screen
+    if (ix0 > ix1 || iy0 > iy1) return;
+
+    // Edge functions for convex quad (CCW winding)
+    float2 corners[4] = {c0, c1, c2, c3};
+    float enx[4], eny[4], ed[4];
+    for (int e = 0; e < 4; e++) {
+        float2 v0 = corners[e];
+        float2 v1 = corners[(e + 1) & 3];
+        enx[e] = v1.y - v0.y;
+        eny[e] = -(v1.x - v0.x);
+        ed[e] = enx[e] * v0.x + eny[e] * v0.y;
+    }
+
+    // Fill all pixels inside the quad
+    for (int py = iy0; py <= iy1; py++) {
+        for (int px = ix0; px <= ix1; px++) {
+            float fx = (float)px + 0.5f;
+            float fy = (float)py + 0.5f;
+            bool inside = true;
+            for (int e = 0; e < 4; e++) {
+                if (enx[e] * fx + eny[e] * fy < ed[e]) { inside = false; break; }
+            }
+            if (inside) {
+                output[py * vp.width + px] = rgba;
+            }
+        }
+    }
+}
+
+// Clear kernel (fills background)
+__global__ void clearKernel(uint32_t* output, int width, int height, uint32_t color) {
+    int px = blockIdx.x * blockDim.x + threadIdx.x;
+    int py = blockIdx.y * blockDim.y + threadIdx.y;
+    if (px < width && py < height)
+        output[py * width + px] = color;
+}
+
+void forwardRenderStation(const GpuViewport& vp, int station_idx,
+                           int product, float dbz_min, uint32_t* d_output) {
+    if (station_idx < 0 || station_idx >= MAX_STATIONS) return;
+    auto& buf = s_stationBufs[station_idx];
+    auto& info = s_stationInfo[station_idx];
+    if (!buf.allocated || !info.has_product[product] || !buf.d_gates[product]) return;
+
+    // Clear to background first
+    dim3 clearBlock(32, 8);
+    dim3 clearGrid((vp.width + 31) / 32, (vp.height + 7) / 8);
+    clearKernel<<<clearGrid, clearBlock>>>(d_output, vp.width, vp.height,
+                                            makeRGBA(15, 15, 20, 255));
+
+    // Forward render: one thread per (radial, gate)
+    dim3 block(32, 8); // 256 threads, warp-aligned
+    dim3 grid((info.num_radials + 31) / 32,
+              (info.num_gates[product] + 7) / 8);
+
+    forwardRenderKernel<<<grid, block>>>(
+        buf.d_azimuths, buf.d_gates[product],
+        info, vp, product, dbz_min,
+        s_colorTextures[product], d_output);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        fprintf(stderr, "Forward render error: %s\n", cudaGetErrorString(err));
 }
 
 void syncStation(int idx) {

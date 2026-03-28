@@ -407,7 +407,7 @@ void App::render() {
         gpuVp.height = m_viewport.height;
 
         if (m_historicMode) {
-            gpu::renderSingleStation(gpuVp, 0,
+            gpu::forwardRenderStation(gpuVp, 0,
                                       m_activeProduct, m_dbzMinThreshold,
                                       m_d_compositeOutput);
         } else if (m_mode3D && m_volumeBuilt) {
@@ -426,7 +426,7 @@ void App::render() {
                               m_d_compositeOutput);
         } else if (m_activeStationIdx >= 0) {
             // Single station: fast path
-            gpu::renderSingleStation(gpuVp, m_activeStationIdx,
+            gpu::forwardRenderStation(gpuVp, m_activeStationIdx,
                                       m_activeProduct, m_dbzMinThreshold,
                                       m_d_compositeOutput);
         } else {
