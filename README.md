@@ -1,6 +1,14 @@
 # cursdar
 
-Real-time NEXRAD radar viewer built entirely on custom CUDA kernels. Downloads all 162 US weather radar stations from AWS S3, parses Level 2 Archive II data, and renders at native resolution using GPU-accelerated pipelines on NVIDIA GPUs.
+> **This is a rough tech demo / proof of concept.** The actual 2D radar rendering currently looks like smoothed garbage compared to proper radar software - the bilinear interpolation produces a blurry mess instead of the crisp, gate-accurate rendering you'd see in GR2Analyst or RadarScope. The data pipeline and GPU architecture are solid, but the visual output needs significant work before this is useful for actual weather analysis. If the rendering gets fixed, there might be something here.
+
+Real-time NEXRAD radar viewer built entirely on custom CUDA kernels. Downloads all 162 US weather radar stations from AWS S3, parses Level 2 Archive II data, and renders using GPU-accelerated pipelines on NVIDIA GPUs.
+
+## Status
+
+**What works well:** The full GPU pipeline - downloading 162 stations in parallel, BZ2 decompression, Level 2 parsing, GPU data transposition, instant station switching, 3D volumetric rendering, cross-sections. The architecture and performance are there.
+
+**What doesn't work well:** The 2D radar rendering quality. It's using inverse-mapping with bilinear interpolation which produces soft, blurry output instead of the sharp per-gate rendering that real radar software does. Color tables need refinement. Split-cut handling works but tilt selection UX is rough. This is not ready for operational use.
 
 ## What it does
 
