@@ -39,29 +39,40 @@ __device__ __host__ static uint32_t makeRGBA(uint8_t r, uint8_t g, uint8_t b, ui
     return (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16) | ((uint32_t)a << 24);
 }
 
+// Map a physical value to a color table index [0..255]
+static int valToIdx(float val, float min_val, float max_val) {
+    int idx = (int)((val - min_val) / (max_val - min_val) * 255.0f);
+    return (idx < 0) ? 0 : (idx > 255) ? 255 : idx;
+}
+
+// Fill a range of indices with one color (stepped, no gradient)
+static void fillRange(uint32_t* table, float v0, float v1, float vmin, float vmax,
+                      uint8_t r, uint8_t g, uint8_t b) {
+    int i0 = valToIdx(v0, vmin, vmax);
+    int i1 = valToIdx(v1, vmin, vmax);
+    for (int i = i0; i < i1 && i < 256; i++)
+        table[i] = makeRGBA(r, g, b);
+}
+
+// ── AWIPS Standard Reflectivity (exact NWS RGB values) ──────
 static void generateRefColorTable(uint32_t* table) {
     memset(table, 0, 256 * sizeof(uint32_t));
-    auto dBZtoIdx = [](float dbz) -> int {
-        int idx = (int)((dbz + 30.0f) * 255.0f / 105.0f);
-        return (idx < 0) ? 0 : (idx > 255) ? 255 : idx;
-    };
-    struct { float dbz; uint8_t r, g, b; } steps[] = {
-        { 5.0f,   4, 233, 231},  {10.0f,   1, 159, 244},
-        {15.0f,   3,   0, 244},  {20.0f,   2, 253,   2},
-        {25.0f,   1, 197,   1},  {30.0f,   0, 142,   0},
-        {35.0f, 253, 248,   2},  {40.0f, 229, 188,   0},
-        {45.0f, 253, 149,   0},  {50.0f, 253,   0,   0},
-        {55.0f, 212,   0,   0},  {60.0f, 188,   0,   0},
-        {65.0f, 248,   0, 253},  {70.0f, 152,  84, 198},
-        {75.0f, 253, 253, 253},
-    };
-    int nsteps = sizeof(steps) / sizeof(steps[0]);
-    for (int s = 0; s < nsteps; s++) {
-        int i0 = dBZtoIdx(steps[s].dbz);
-        int i1 = (s + 1 < nsteps) ? dBZtoIdx(steps[s + 1].dbz) : 256;
-        for (int i = i0; i < i1 && i < 256; i++)
-            table[i] = makeRGBA(steps[s].r, steps[s].g, steps[s].b);
-    }
+    const float mn = -30, mx = 75;
+    fillRange(table,  5, 10, mn, mx,   0, 131, 174); // teal
+    fillRange(table, 10, 15, mn, mx,  65,  90, 160); // slate blue
+    fillRange(table, 15, 20, mn, mx,  62, 169, 214); // sky blue
+    fillRange(table, 20, 25, mn, mx,   0, 220, 183); // cyan-green
+    fillRange(table, 25, 30, mn, mx,  15, 195,  21); // bright green
+    fillRange(table, 30, 35, mn, mx,  11, 147,  22); // medium green
+    fillRange(table, 35, 40, mn, mx,  10,  95,  19); // dark green
+    fillRange(table, 40, 45, mn, mx, 255, 245,   5); // yellow
+    fillRange(table, 45, 50, mn, mx, 255, 190,   0); // orange
+    fillRange(table, 50, 55, mn, mx, 255,   0,   0); // red
+    fillRange(table, 55, 60, mn, mx, 120,   0,   0); // dark red
+    fillRange(table, 60, 65, mn, mx, 255, 255, 255); // white
+    fillRange(table, 65, 70, mn, mx, 201, 161, 255); // lavender
+    fillRange(table, 70, 75, mn, mx, 174,   0, 255); // purple
+    fillRange(table, 75, 76, mn, mx,   5, 221, 225); // bright cyan
 }
 
 static void interpolateColor(uint32_t* table, int i0, int i1,
@@ -76,46 +87,106 @@ static void interpolateColor(uint32_t* table, int i0, int i1,
     }
 }
 
+// ── AWIPS Enhanced Base Velocity (exact NWS values) ─────────
 static void generateVelColorTable(uint32_t* table) {
     memset(table, 0, 256 * sizeof(uint32_t));
-    interpolateColor(table, 1, 32,    0, 255, 0,    0, 200, 0);
-    interpolateColor(table, 32, 64,   0, 200, 0,    0, 150, 0);
-    interpolateColor(table, 64, 96,   0, 150, 0,    0, 100, 50);
-    interpolateColor(table, 96, 128,  0, 100, 50,   50, 50, 50);
-    interpolateColor(table, 128, 160, 50, 50, 50,   100, 50, 0);
-    interpolateColor(table, 160, 192, 100, 50, 0,   200, 100, 0);
-    interpolateColor(table, 192, 224, 200, 100, 0,  255, 50, 0);
-    interpolateColor(table, 224, 255, 255, 50, 0,   255, 0, 0);
+    const float mn = -64, mx = 64;
+    // Approaching (negative = green/blue)
+    fillRange(table, -64, -50, mn, mx,   0,   0, 100); // dark blue
+    fillRange(table, -50, -40, mn, mx, 100, 255, 255); // cyan
+    fillRange(table, -40, -30, mn, mx,   0, 255,   0); // bright green
+    fillRange(table, -30, -20, mn, mx,   0, 209,   0); // green
+    fillRange(table, -20, -10, mn, mx,   0, 163,   0); // med green
+    fillRange(table, -10,  -5, mn, mx,   0, 116,   0); // dark green
+    fillRange(table,  -5,   0, mn, mx,   0,  70,   0); // very dark green
+    // Near zero
+    fillRange(table,   0,   5, mn, mx, 120, 120, 120); // gray
+    // Receding (positive = red/orange)
+    fillRange(table,   5,  10, mn, mx,  70,   0,   0); // very dark red
+    fillRange(table,  10,  20, mn, mx, 116,   0,   0); // dark red
+    fillRange(table,  20,  30, mn, mx, 209,   0,   0); // red
+    fillRange(table,  30,  40, mn, mx, 255,   0,   0); // bright red
+    fillRange(table,  40,  50, mn, mx, 255, 129, 125); // pink
+    fillRange(table,  50,  60, mn, mx, 255, 140,  70); // orange
+    fillRange(table,  60,  64, mn, mx, 255, 255,   0); // yellow
 }
 
 static void uploadColorTables() {
     uint32_t tables[NUM_PRODUCTS][256];
     generateRefColorTable(tables[PROD_REF]);
     generateVelColorTable(tables[PROD_VEL]);
-    // SW
+
+    // ── AWIPS Spectrum Width ────────────────────────────────
     memset(tables[PROD_SW], 0, 256*4);
-    interpolateColor(tables[PROD_SW], 1, 60, 40,40,40, 0,100,0);
-    interpolateColor(tables[PROD_SW], 60, 130, 0,100,0, 0,255,0);
-    interpolateColor(tables[PROD_SW], 130, 200, 0,255,0, 255,255,0);
-    interpolateColor(tables[PROD_SW], 200, 255, 255,255,0, 255,0,0);
-    // ZDR
+    {
+        const float mn = 0, mx = 30;
+        fillRange(tables[PROD_SW],  0,  3, mn, mx,  45,  45,  45);
+        fillRange(tables[PROD_SW],  3,  5, mn, mx, 117, 117, 117);
+        fillRange(tables[PROD_SW],  5,  7, mn, mx, 200, 200, 200);
+        fillRange(tables[PROD_SW],  7,  9, mn, mx, 255, 230,   0);
+        fillRange(tables[PROD_SW],  9, 12, mn, mx, 255, 195,   0);
+        fillRange(tables[PROD_SW], 12, 15, mn, mx, 255, 110,   0);
+        fillRange(tables[PROD_SW], 15, 18, mn, mx, 255,  10,   0);
+        fillRange(tables[PROD_SW], 18, 22, mn, mx, 255,   5, 100);
+        fillRange(tables[PROD_SW], 22, 26, mn, mx, 255,   0, 200);
+        fillRange(tables[PROD_SW], 26, 30, mn, mx, 255, 159, 234);
+    }
+
+    // ── AWIPS Differential Reflectivity (ZDR) ───────────────
     memset(tables[PROD_ZDR], 0, 256*4);
-    interpolateColor(tables[PROD_ZDR], 1, 128, 0,0,180, 100,100,180);
-    interpolateColor(tables[PROD_ZDR], 128, 192, 200,200,200, 255,255,0);
-    interpolateColor(tables[PROD_ZDR], 192, 255, 255,255,0, 255,0,0);
-    // CC
+    {
+        const float mn = -8, mx = 8;
+        fillRange(tables[PROD_ZDR], -8, -3, mn, mx,  55,  55,  55);
+        fillRange(tables[PROD_ZDR], -3, -1, mn, mx, 138, 138, 138);
+        fillRange(tables[PROD_ZDR], -1,  0, mn, mx, 148, 132, 177);
+        fillRange(tables[PROD_ZDR],  0,  0.5f, mn, mx,  29,  89, 174);
+        fillRange(tables[PROD_ZDR],  0.5f, 1, mn, mx,  49, 169, 193);
+        fillRange(tables[PROD_ZDR],  1, 1.5f, mn, mx,  68, 248, 212);
+        fillRange(tables[PROD_ZDR],  1.5f, 2, mn, mx,  90, 221,  98);
+        fillRange(tables[PROD_ZDR],  2, 2.5f, mn, mx, 255, 255, 100);
+        fillRange(tables[PROD_ZDR],  2.5f, 3, mn, mx, 238, 133,  53);
+        fillRange(tables[PROD_ZDR],  3, 4, mn, mx, 220,  10,   5);
+        fillRange(tables[PROD_ZDR],  4, 5, mn, mx, 208,  60,  90);
+        fillRange(tables[PROD_ZDR],  5, 6, mn, mx, 240, 120, 180);
+        fillRange(tables[PROD_ZDR],  6, 7, mn, mx, 255, 255, 255);
+        fillRange(tables[PROD_ZDR],  7, 8, mn, mx, 200, 150, 203);
+    }
+
+    // ── AWIPS Correlation Coefficient (CC/RhoHV) ────────────
     memset(tables[PROD_CC], 0, 256*4);
-    interpolateColor(tables[PROD_CC], 1, 60, 0,0,100, 128,0,128);
-    interpolateColor(tables[PROD_CC], 60, 170, 128,0,128, 255,150,0);
-    interpolateColor(tables[PROD_CC], 170, 230, 255,150,0, 0,200,0);
-    interpolateColor(tables[PROD_CC], 230, 255, 0,200,0, 255,255,255);
-    // KDP
+    {
+        const float mn = 0.2f, mx = 1.05f;
+        fillRange(tables[PROD_CC], 0.20f, 0.45f, mn, mx,  20,   0,  50);
+        fillRange(tables[PROD_CC], 0.45f, 0.60f, mn, mx,   0,   0, 110);
+        fillRange(tables[PROD_CC], 0.60f, 0.70f, mn, mx,   0,   0, 150);
+        fillRange(tables[PROD_CC], 0.70f, 0.75f, mn, mx,   0,   0, 170);
+        fillRange(tables[PROD_CC], 0.75f, 0.80f, mn, mx,   0,   0, 255);
+        fillRange(tables[PROD_CC], 0.80f, 0.85f, mn, mx, 125, 125, 255);
+        fillRange(tables[PROD_CC], 0.85f, 0.90f, mn, mx,  85, 255,  85);
+        fillRange(tables[PROD_CC], 0.90f, 0.92f, mn, mx, 255, 255,   0);
+        fillRange(tables[PROD_CC], 0.92f, 0.95f, mn, mx, 255, 110,   0);
+        fillRange(tables[PROD_CC], 0.95f, 0.97f, mn, mx, 255,  55,   0);
+        fillRange(tables[PROD_CC], 0.97f, 1.00f, mn, mx, 255,   0,   0);
+        fillRange(tables[PROD_CC], 1.00f, 1.05f, mn, mx, 145,   0, 135);
+    }
+
+    // ── AWIPS Specific Differential Phase (KDP) ─────────────
     memset(tables[PROD_KDP], 0, 256*4);
-    interpolateColor(tables[PROD_KDP], 1, 80, 0,0,150, 0,150,255);
-    interpolateColor(tables[PROD_KDP], 80, 128, 0,150,255, 0,255,0);
-    interpolateColor(tables[PROD_KDP], 128, 200, 0,255,0, 255,255,0);
-    interpolateColor(tables[PROD_KDP], 200, 255, 255,255,0, 255,0,0);
-    // PHI
+    {
+        const float mn = -10, mx = 15;
+        fillRange(tables[PROD_KDP], -10, -1, mn, mx, 101, 101, 101);
+        fillRange(tables[PROD_KDP],  -1,  0, mn, mx, 166,  10,  50);
+        fillRange(tables[PROD_KDP],   0,  1, mn, mx, 228, 105, 161);
+        fillRange(tables[PROD_KDP],   1,  2, mn, mx, 166, 125, 185);
+        fillRange(tables[PROD_KDP],   2,  3, mn, mx,  90, 255, 255);
+        fillRange(tables[PROD_KDP],   3,  4, mn, mx,  20, 246,  20);
+        fillRange(tables[PROD_KDP],   4,  5, mn, mx, 255, 251,   3);
+        fillRange(tables[PROD_KDP],   5,  6, mn, mx, 255, 129,  21);
+        fillRange(tables[PROD_KDP],   6,  8, mn, mx, 255, 162,  75);
+        fillRange(tables[PROD_KDP],   8, 15, mn, mx, 145,  37, 125);
+    }
+
+    // ── Differential Phase (PHI) ────────────────────────────
     memset(tables[PROD_PHI], 0, 256*4);
     interpolateColor(tables[PROD_PHI], 1, 64, 0,0,200, 0,200,255);
     interpolateColor(tables[PROD_PHI], 64, 128, 0,200,255, 0,255,0);
@@ -190,58 +261,26 @@ __device__ float sampleStation(
     float max_range = fgkm + ng * gskm;
     if (range_km < fgkm || range_km > max_range) return -999.0f;
 
-    // Find bracketing radials
+    // Nearest radial + nearest gate (crisp per-gate rendering)
     int idx_hi = bsearchAz(ptrs.azimuths, nr, az);
     int idx_lo = (idx_hi == 0) ? nr - 1 : idx_hi - 1;
     if (idx_hi >= nr) idx_hi = 0;
 
-    float az_lo = ptrs.azimuths[idx_lo];
-    float az_hi = ptrs.azimuths[idx_hi];
-    float daz = az_hi - az_lo;
-    if (daz < 0) daz += 360.0f;
-    float az_off = az - az_lo;
-    if (az_off < 0) az_off += 360.0f;
-    float t_az = (daz > 0.001f) ? (az_off / daz) : 0.0f;
-    t_az = fminf(fmaxf(t_az, 0.0f), 1.0f);
+    float d_lo = fabsf(az - ptrs.azimuths[idx_lo]);
+    float d_hi = fabsf(az - ptrs.azimuths[idx_hi]);
+    if (d_lo > 180.0f) d_lo = 360.0f - d_lo;
+    if (d_hi > 180.0f) d_hi = 360.0f - d_hi;
+    int ri = (d_lo <= d_hi) ? idx_lo : idx_hi;
 
-    // Gate index
-    float gate_f = (range_km - fgkm) / gskm;
-    int g0 = (int)gate_f;
-    int g1 = g0 + 1;
-    float t_g = gate_f - (float)g0;
-    if (g0 < 0) g0 = 0;
-    if (g1 >= ng) g1 = ng - 1;
-    if (g0 >= ng) return -999.0f;
+    int gi = (int)((range_km - fgkm) / gskm);
+    if (gi < 0 || gi >= ng) return -999.0f;
 
-    // Read 4 gate values (gate-major: gates[gate * num_radials + radial])
     const uint16_t* gd = ptrs.gates[product];
-    uint16_t v00 = gd[g0 * nr + idx_lo];
-    uint16_t v01 = gd[g0 * nr + idx_hi];
-    uint16_t v10 = gd[g1 * nr + idx_lo];
-    uint16_t v11 = gd[g1 * nr + idx_hi];
+    uint16_t raw = gd[gi * nr + ri];
+    if (raw <= 1) return -999.0f;
 
     float sc = info.scale[product], off = info.offset[product];
-    auto decode = [sc, off](uint16_t raw) -> float {
-        return (raw <= 1) ? -999.0f : ((float)raw - off) / sc;
-    };
-
-    float f00 = decode(v00), f01 = decode(v01);
-    float f10 = decode(v10), f11 = decode(v11);
-
-    // Bilinear interpolation with missing-data handling
-    float value;
-    if (f00 > -998.0f && f01 > -998.0f && f10 > -998.0f && f11 > -998.0f) {
-        value = f00 * (1-t_az)*(1-t_g) + f01 * t_az*(1-t_g)
-              + f10 * (1-t_az)*t_g     + f11 * t_az*t_g;
-    } else {
-        // Nearest valid
-        float best_w = -1.0f; value = -999.0f;
-        auto tryV = [&](float v, float w) { if (v > -998.0f && w > best_w) { best_w = w; value = v; } };
-        tryV(f00, (1-t_az)*(1-t_g));
-        tryV(f01, t_az*(1-t_g));
-        tryV(f10, (1-t_az)*t_g);
-        tryV(f11, t_az*t_g);
-    }
+    float value = ((float)raw - off) / sc;
 
     if (value <= -998.0f) return -999.0f;
 
@@ -557,49 +596,28 @@ __global__ void singleStationKernel(
         s_az[i] = azimuths[i];
     __syncthreads();
 
+    // Nearest radial (no interpolation - crisp per-gate rendering like RadarScope)
     int idx_hi = bsearchAz(s_az, nr, az);
     int idx_lo = (idx_hi == 0) ? nr - 1 : idx_hi - 1;
     if (idx_hi >= nr) idx_hi = 0;
 
-    float az_lo = s_az[idx_lo], az_hi = s_az[idx_hi];
-    float daz = az_hi - az_lo;
-    if (daz < 0) daz += 360.0f;
-    float az_off = az - az_lo;
-    if (az_off < 0) az_off += 360.0f;
-    float t_az = (daz > 0.001f) ? (az_off / daz) : 0.0f;
-    t_az = fminf(fmaxf(t_az, 0.0f), 1.0f);
+    // Pick the closer radial
+    float d_lo = fabsf(az - s_az[idx_lo]);
+    float d_hi = fabsf(az - s_az[idx_hi]);
+    if (d_lo > 180.0f) d_lo = 360.0f - d_lo;
+    if (d_hi > 180.0f) d_hi = 360.0f - d_hi;
+    int ri = (d_lo <= d_hi) ? idx_lo : idx_hi;
 
-    // Gate index
-    float gate_f = (range_km - fgkm) / gskm;
-    int g0 = (int)gate_f, g1 = g0 + 1;
-    float t_g = gate_f - (float)g0;
-    if (g0 < 0) g0 = 0;
-    if (g1 >= ng) g1 = ng - 1;
-    if (g0 >= ng) { output[py * vp.width + px] = bg; return; }
+    // Nearest gate (integer index, no fractional interpolation)
+    int gi = (int)((range_km - fgkm) / gskm);
+    if (gi < 0 || gi >= ng) { output[py * vp.width + px] = bg; return; }
 
-    // Bilinear sample (gate-major layout)
-    uint16_t v00 = gates[g0 * nr + idx_lo];
-    uint16_t v01 = gates[g0 * nr + idx_hi];
-    uint16_t v10 = gates[g1 * nr + idx_lo];
-    uint16_t v11 = gates[g1 * nr + idx_hi];
+    // Single gate read (gate-major layout)
+    uint16_t raw = gates[gi * nr + ri];
+    if (raw <= 1) { output[py * vp.width + px] = bg; return; }
 
     float sc = info.scale[product], off = info.offset[product];
-    auto decode = [sc, off](uint16_t raw) -> float {
-        return (raw <= 1) ? -999.0f : ((float)raw - off) / sc;
-    };
-
-    float f00 = decode(v00), f01 = decode(v01);
-    float f10 = decode(v10), f11 = decode(v11);
-
-    float value;
-    if (f00 > -998.0f && f01 > -998.0f && f10 > -998.0f && f11 > -998.0f) {
-        value = f00*(1-t_az)*(1-t_g) + f01*t_az*(1-t_g) + f10*(1-t_az)*t_g + f11*t_az*t_g;
-    } else {
-        float best_w = -1.0f; value = -999.0f;
-        auto tryV = [&](float v, float w) { if (v > -998.0f && w > best_w) { best_w=w; value=v; } };
-        tryV(f00, (1-t_az)*(1-t_g)); tryV(f01, t_az*(1-t_g));
-        tryV(f10, (1-t_az)*t_g);     tryV(f11, t_az*t_g);
-    }
+    float value = ((float)raw - off) / sc;
 
     if (value <= -998.0f) { output[py * vp.width + px] = bg; return; }
 

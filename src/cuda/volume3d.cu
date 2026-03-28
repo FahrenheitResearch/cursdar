@@ -289,13 +289,13 @@ __global__ void rayMarchKernel(
 }
 
 // ── Cross-section kernel ─────────────────────────────────────
-// Renders a vertical slice through the volume along a user-defined line.
-// X-axis = distance along line, Y-axis = altitude, sampled from the 3D texture.
+// Direct sampling from sweep data (no volume texture). Each pixel maps to
+// a specific (distance_along_line, altitude) → find the sweep closest to
+// that elevation angle and sample the nearest gate. Crisp, no interpolation.
 
 __global__ void crossSectionKernel(
-    cudaTextureObject_t volTex,
-    float start_x_km, float start_y_km,  // line start in station-relative km
-    float dir_x, float dir_y,             // normalized direction along line
+    float start_x_km, float start_y_km,
+    float dir_x, float dir_y,
     float total_dist_km,
     int width, int height,
     int product, float dbz_min,
@@ -305,51 +305,80 @@ __global__ void crossSectionKernel(
     int py = blockIdx.y * blockDim.y + threadIdx.y;
     if (px >= width || py >= height) return;
 
-    // X = distance along line, Y = altitude
     float dist_km = ((float)px / width) * total_dist_km;
     float alt_km = (1.0f - (float)py / height) * VOL_HEIGHT_KM;
 
-    // Position in volume
     float x_km = start_x_km + dir_x * dist_km;
     float y_km = start_y_km + dir_y * dist_km;
 
-    float tx = x_km / VOL_RANGE_KM * 0.5f + 0.5f;
-    float ty = y_km / VOL_RANGE_KM * 0.5f + 0.5f;
-    float tz = alt_km / VOL_HEIGHT_KM;
-
-    // Background: dark gradient
+    // Background with subtle grid
     float bgf = 0.04f + (1.0f - (float)py / height) * 0.02f;
     uint32_t bg = mkRGBA((uint8_t)(bgf*200), (uint8_t)(bgf*210), (uint8_t)(bgf*255));
-
-    // Grid lines: every 50km horizontal, every 2km vertical
     float hgrid = fmodf(dist_km, 50.0f);
     float vgrid = fmodf(alt_km, 2.0f);
-    bool onGrid = (fminf(hgrid, 50.0f - hgrid) < 0.8f) || (fminf(vgrid, 2.0f - vgrid) < 0.06f);
-    if (onGrid) {
-        bg = mkRGBA((uint8_t)(bgf*200+15), (uint8_t)(bgf*210+20), (uint8_t)(bgf*255+25));
+    if (fminf(hgrid, 50.0f-hgrid) < 0.6f || fminf(vgrid, 2.0f-vgrid) < 0.04f)
+        bg = mkRGBA((uint8_t)(bgf*200+12), (uint8_t)(bgf*210+16), (uint8_t)(bgf*255+20));
+
+    // Horizontal range and elevation angle from station to this point
+    float horiz_range = sqrtf(x_km*x_km + y_km*y_km);
+    float azimuth = atan2f(x_km, y_km) * (180.0f / (float)M_PI);
+    if (azimuth < 0) azimuth += 360.0f;
+    float elev_angle = atan2f(alt_km, horiz_range) * (180.0f / (float)M_PI);
+    float slant_range = sqrtf(horiz_range*horiz_range + alt_km*alt_km);
+
+    // Find nearest sweep by elevation
+    int best_sw = -1;
+    float best_diff = 999.0f;
+    for (int s = 0; s < c_numSweeps; s++) {
+        float d = fabsf(c_sweeps[s].elevation_deg - elev_angle);
+        if (d < best_diff) { best_diff = d; best_sw = s; }
     }
 
-    if (tx < 0 || tx > 1 || ty < 0 || ty > 1 || tz < 0 || tz > 1) {
+    if (best_sw < 0 || best_diff > 3.0f) {
         output[py * width + px] = bg;
         return;
     }
 
-    float val = tex3D<float>(volTex, tx, ty, tz);
-    if (val <= dbz_min) {
+    const SweepDesc& sw = c_sweeps[best_sw];
+    if (!sw.gates || sw.num_radials <= 0 || sw.gate_spacing_km <= 0) {
         output[py * width + px] = bg;
         return;
     }
+
+    float max_r = sw.first_gate_km + sw.num_gates * sw.gate_spacing_km;
+    if (slant_range < sw.first_gate_km || slant_range > max_r) {
+        output[py * width + px] = bg;
+        return;
+    }
+
+    // Nearest radial (no interpolation)
+    int ih = bsAz(sw.azimuths, sw.num_radials, azimuth);
+    int il = (ih == 0) ? sw.num_radials - 1 : ih - 1;
+    if (ih >= sw.num_radials) ih = 0;
+    float dl = fabsf(azimuth - sw.azimuths[il]);
+    float dh = fabsf(azimuth - sw.azimuths[ih]);
+    if (dl > 180) dl = 360-dl;
+    if (dh > 180) dh = 360-dh;
+    int ri = (dl <= dh) ? il : ih;
+
+    // Nearest gate
+    int gi = (int)((slant_range - sw.first_gate_km) / sw.gate_spacing_km);
+    if (gi < 0 || gi >= sw.num_gates) {
+        output[py * width + px] = bg;
+        return;
+    }
+
+    uint16_t raw = sw.gates[gi * sw.num_radials + ri];
+    if (raw <= 1) { output[py * width + px] = bg; return; }
+
+    float val = ((float)raw - sw.offset) / sw.scale;
+    if (val <= dbz_min) { output[py * width + px] = bg; return; }
 
     // Color
     float norm = fminf(fmaxf((val + 30.0f) / 105.0f, 0.0f), 1.0f);
     int cidx = min(max((int)(norm * 254.0f) + 1, 1), 255);
     uint32_t color = c_colorTable[product][cidx];
-    uint8_t cr = color & 0xFF;
-    uint8_t cg = (color >> 8) & 0xFF;
-    uint8_t cb = (color >> 16) & 0xFF;
-
-    // Full opacity for cross-section (it's a 2D slice, should be solid)
-    output[py * width + px] = mkRGBA(cr, cg, cb);
+    output[py * width + px] = color | 0xFF000000u; // force full alpha
 }
 
 // ── API ─────────────────────────────────────────────────────
@@ -491,7 +520,6 @@ void renderCrossSection(
     dim3 grid((width+15)/16, (height+15)/16);
 
     crossSectionKernel<<<grid, block>>>(
-        d_volume_tex,
         sx_km, sy_km, nx, ny, total,
         width, height, product, dbz_min, d_output);
     CUDA_CHECK(cudaGetLastError());
