@@ -60,6 +60,9 @@ struct MessageHeader {
 
     uint16_t messageSize()  const { return bswap16(message_size_be); }
     uint8_t  messageType()  const { return message_type; }
+    uint16_t numSegments()  const { return bswap16(num_segments_be); }
+    uint16_t segmentNumber() const { return bswap16(segment_number_be); }
+    uint16_t sequenceId()   const { return bswap16(id_sequence_be); }
     uint32_t milliseconds() const { return bswap32(milliseconds_be); }
 };
 static_assert(sizeof(MessageHeader) == 16, "MessageHeader must be 16 bytes");

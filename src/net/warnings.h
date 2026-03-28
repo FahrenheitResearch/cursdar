@@ -4,6 +4,8 @@
 #include <mutex>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <thread>
 
 struct WarningPolygon {
     std::string event;    // "Tornado Warning", "Severe Thunderstorm Warning", etc.
@@ -16,6 +18,8 @@ struct WarningPolygon {
 
 class WarningFetcher {
 public:
+    ~WarningFetcher();
+
     void startPolling();
     void stop();
 
@@ -30,4 +34,7 @@ private:
     std::vector<WarningPolygon> m_warnings;
     mutable std::mutex m_mutex;
     std::atomic<bool> m_running{false};
+    std::mutex m_pollMutex;
+    std::condition_variable m_pollCv;
+    std::thread m_thread;
 };

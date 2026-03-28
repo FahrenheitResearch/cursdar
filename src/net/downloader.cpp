@@ -10,6 +10,7 @@
 #endif
 
 #include <cstdio>
+#include <exception>
 #include <string>
 
 // ── HTTP synchronous GET (WinHTTP on Windows, libcurl on Linux) ──
@@ -23,6 +24,13 @@ static size_t curlWriteCallback(void* contents, size_t size, size_t nmemb, void*
     vec->insert(vec->end(), data, data + totalBytes);
     return totalBytes;
 }
+
+struct CurlGlobalInit {
+    CurlGlobalInit() { curl_global_init(CURL_GLOBAL_DEFAULT); }
+    ~CurlGlobalInit() { curl_global_cleanup(); }
+};
+
+static const CurlGlobalInit kCurlGlobalInit;
 #endif
 
 DownloadResult Downloader::httpGet(const std::string& host, const std::string& path,
@@ -165,6 +173,7 @@ DownloadResult Downloader::httpGet(const std::string& host, const std::string& p
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, ""); // auto decompress
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, https ? 1L : 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, https ? 2L : 0L);
 
@@ -210,6 +219,7 @@ void Downloader::queueDownload(const std::string& id,
                                 Callback callback) {
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_shutdown.load()) return;
         m_queue.push({id, host, path, std::move(callback)});
         m_pending++;
     }
@@ -222,10 +232,21 @@ void Downloader::waitAll() {
 }
 
 void Downloader::shutdown() {
-    m_shutdown = true;
+    size_t dropped = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_shutdown = true;
+        dropped = m_queue.size();
+        while (!m_queue.empty()) m_queue.pop();
+    }
+    if (dropped > 0) {
+        m_pending.fetch_sub((int)dropped);
+        m_doneCV.notify_all();
+    }
     m_cv.notify_all();
     for (auto& t : m_workers) {
-        if (t.joinable()) t.join();
+        if (t.joinable() && t.get_id() != std::this_thread::get_id())
+            t.join();
     }
     m_workers.clear();
 }
@@ -241,10 +262,27 @@ void Downloader::workerThread() {
             m_queue.pop();
         }
 
-        auto result = httpGet(task.host, task.path);
+        DownloadResult result;
+        try {
+            result = httpGet(task.host, task.path);
+        } catch (const std::exception& ex) {
+            result.success = false;
+            result.status_code = 0;
+            result.error = std::string("httpGet threw: ") + ex.what();
+        } catch (...) {
+            result.success = false;
+            result.status_code = 0;
+            result.error = "httpGet threw unknown exception";
+        }
 
         if (task.callback) {
-            task.callback(task.id, std::move(result));
+            try {
+                task.callback(task.id, std::move(result));
+            } catch (const std::exception& ex) {
+                std::fprintf(stderr, "Downloader callback threw: %s\n", ex.what());
+            } catch (...) {
+                std::fprintf(stderr, "Downloader callback threw unknown exception\n");
+            }
         }
 
         m_pending--;

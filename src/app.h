@@ -43,6 +43,26 @@ struct StationState {
     std::vector<PrecomputedSweep> precomputed; // all sweeps, ready for GPU
     std::chrono::steady_clock::time_point lastUpdate;
     Detection detection;
+    int uploaded_product = -1;
+    int uploaded_tilt = -1;
+    int uploaded_sweep = -1;
+};
+
+struct StationUiState {
+    int          index = -1;
+    std::string  icao;
+    float        lat = 0.0f, lon = 0.0f;
+    float        display_lat = 0.0f, display_lon = 0.0f;
+    bool         downloading = false;
+    bool         parsed = false;
+    bool         uploaded = false;
+    bool         rendered = false;
+    bool         failed = false;
+    std::string  error;
+    int          sweep_count = 0;
+    float        lowest_elev = 0.0f;
+    int          lowest_radials = 0;
+    Detection    detection;
 };
 
 class App {
@@ -108,7 +128,7 @@ public:
     void prevTilt();
 
     // Station info for UI
-    const std::vector<StationState>& stations() const { return m_stations; }
+    std::vector<StationUiState> stations() const;
 
     // Force re-render all stations (e.g., after product change)
     void rerenderAll();
@@ -128,6 +148,11 @@ private:
 
     // Build spatial grid for compositor
     void buildSpatialGrid();
+    void invalidateFrameCache(bool freeMemory = false);
+    void ensureCrossSectionBuffer(int width, int height);
+    void rebuildVolumeForCurrentSelection();
+    bool stationUploadMatchesSelection(const StationState& st) const;
+    void refreshActiveTiltMetadata();
 
     Viewport         m_viewport;
     int              m_activeProduct = 0;
@@ -156,7 +181,7 @@ private:
     std::unique_ptr<Downloader> m_downloader;
 
     // Mutex for station state updates from download threads
-    std::mutex m_stationMutex;
+    mutable std::mutex m_stationMutex;
 
     // Queue of stations ready to upload to GPU (from download threads)
     std::vector<int> m_uploadQueue;
@@ -179,6 +204,7 @@ private:
     uint32_t* m_d_xsOutput = nullptr;
     GlCudaTexture m_xsTex;          // separate GL texture for cross-section panel
     int m_xsWidth = 0, m_xsHeight = 0;
+    int m_xsAllocWidth = 0, m_xsAllocHeight = 0;
 
     // Re-render flag
     bool m_needsRerender = true;
@@ -204,11 +230,11 @@ public:
     bool  m_srvMode = false;
     float m_stormSpeed = 15.0f;  // m/s
     float m_stormDir = 225.0f;   // degrees from north
-    void toggleSRV() { m_srvMode = !m_srvMode; }
+    void toggleSRV();
     bool srvMode() const { return m_srvMode; }
     float stormSpeed() const { return m_stormSpeed; }
     float stormDir() const { return m_stormDir; }
-    void setStormMotion(float speed, float dir) { m_stormSpeed = speed; m_stormDir = dir; }
+    void setStormMotion(float speed, float dir);
 
     // Detection overlays
     bool m_showTDS = false;
@@ -231,6 +257,14 @@ public:
     static constexpr int MAX_CACHED_FRAMES = 60;
     uint32_t* m_cachedFrames[MAX_CACHED_FRAMES] = {};
     int m_cachedFrameCount = 0;
+    int m_cachedFrameWidth = 0;
+    int m_cachedFrameHeight = 0;
     void cacheAnimFrame(int frameIdx, const uint32_t* d_src, int w, int h);
-    bool hasCachedFrame(int frameIdx) const { return frameIdx < m_cachedFrameCount && m_cachedFrames[frameIdx]; }
+    bool hasCachedFrame(int frameIdx, int w, int h) const {
+        return frameIdx >= 0 &&
+               frameIdx < m_cachedFrameCount &&
+               m_cachedFrames[frameIdx] &&
+               m_cachedFrameWidth == w &&
+               m_cachedFrameHeight == h;
+    }
 };

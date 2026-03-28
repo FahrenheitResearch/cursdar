@@ -39,6 +39,7 @@ void init() {
 
 void render(App& app) {
     auto& vp = app.viewport();
+    const auto stations = app.stations();
 
     // Background radar image
     auto* drawList = ImGui::GetBackgroundDrawList();
@@ -104,10 +105,10 @@ void render(App& app) {
                     }
                 }
             }
-        } else if (asi >= 0 && asi < (int)app.stations().size()) {
-            auto& st = app.stations()[asi];
-            slat = st.gpuInfo.lat != 0 ? st.gpuInfo.lat : st.lat;
-            slon = st.gpuInfo.lon != 0 ? st.gpuInfo.lon : st.lon;
+        } else if (asi >= 0 && asi < (int)stations.size()) {
+            const auto& st = stations[asi];
+            slat = st.display_lat;
+            slon = st.display_lon;
         }
 
         if (slat != 0 && slon != 0 && !app.showAll() && !app.mode3D()) {
@@ -362,9 +363,8 @@ void render(App& app) {
 
     ImGui::BeginChild("station_list", ImVec2(0, 0), ImGuiChildFlags_None);
 
-    auto& stations = app.stations();
     for (int i = 0; i < (int)stations.size(); i++) {
-        auto& st = stations[i];
+        const auto& st = stations[i];
         ImVec4 color;
         if (st.rendered)      color = ImVec4(0.3f, 1.0f, 0.3f, 1.0f); // green
         else if (st.uploaded) color = ImVec4(0.8f, 0.8f, 0.3f, 1.0f); // yellow
@@ -381,10 +381,10 @@ void render(App& app) {
             ImGui::Text("Lat: %.4f  Lon: %.4f", st.lat, st.lon);
             if (st.failed) ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "Error: %s", st.error.c_str());
             if (st.parsed) {
-                ImGui::Text("Sweeps: %d", (int)st.parsedData.sweeps.size());
-                if (!st.parsedData.sweeps.empty()) {
-                    ImGui::Text("Lowest elev: %.1f deg", st.parsedData.sweeps[0].elevation_angle);
-                    ImGui::Text("Radials: %d", (int)st.parsedData.sweeps[0].radials.size());
+                ImGui::Text("Sweeps: %d", st.sweep_count);
+                if (st.sweep_count > 0) {
+                    ImGui::Text("Lowest elev: %.1f deg", st.lowest_elev);
+                    ImGui::Text("Radials: %d", st.lowest_radials);
                 }
             }
             ImGui::EndTooltip();
@@ -408,16 +408,15 @@ void render(App& app) {
     if (app.m_historicMode) goto skip_station_markers;
     {
         auto* dl = ImGui::GetBackgroundDrawList();
-        auto& stations2 = app.stations();
         int activeIdx = app.activeStation();
 
-        for (int i = 0; i < (int)stations2.size(); i++) {
-            auto& st = stations2[i];
+        for (int i = 0; i < (int)stations.size(); i++) {
+            const auto& st = stations[i];
             if (!st.uploaded && !st.parsed) continue;
 
             // Convert lat/lon to screen pixel
-            float px = (float)((st.lon - vp.center_lon) * vp.zoom + vp.width * 0.5);
-            float py = (float)((vp.center_lat - st.lat) * vp.zoom + vp.height * 0.5);
+            float px = (float)((st.display_lon - vp.center_lon) * vp.zoom + vp.width * 0.5);
+            float py = (float)((vp.center_lat - st.display_lat) * vp.zoom + vp.height * 0.5);
 
             // Skip if off-screen
             if (px < -50 || px > vp.width + 50 || py < -50 || py > vp.height + 50)
@@ -490,9 +489,9 @@ void render(App& app) {
     {
         auto* ddl = ImGui::GetBackgroundDrawList();
         int dsi = app.activeStation();
-        if (dsi >= 0 && dsi < (int)app.stations().size()) {
-            auto& dst = app.stations()[dsi];
-            auto& det = dst.detection;
+        if (dsi >= 0 && dsi < (int)stations.size()) {
+            const auto& dst = stations[dsi];
+            const auto& det = dst.detection;
 
             // TDS markers: white inverted triangles with red border
             if (app.m_showTDS && !det.tds.empty()) {

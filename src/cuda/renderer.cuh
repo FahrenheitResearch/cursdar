@@ -23,10 +23,16 @@ struct GpuStationPtrs {
 };
 
 struct GpuStationBuffers {
-    float*    d_azimuths;
-    uint16_t* d_gates[NUM_PRODUCTS];
+    float*    d_azimuths = nullptr;
+    uint16_t* d_gates[NUM_PRODUCTS] = {};
     bool      allocated = false;
-    cudaStream_t stream;
+    cudaStream_t stream = nullptr;
+    int       azimuth_capacity = 0;
+    size_t    gate_capacity_bytes[NUM_PRODUCTS] = {};
+    float*    h_azimuths = nullptr;
+    size_t    h_azimuth_capacity_bytes = 0;
+    uint16_t* h_gates[NUM_PRODUCTS] = {};
+    size_t    h_gate_capacity_bytes[NUM_PRODUCTS] = {};
 };
 
 struct GpuViewport {
@@ -71,10 +77,13 @@ void renderNative(const GpuViewport& vp,
 void renderSingleStation(const GpuViewport& vp,
                           int station_idx,
                           int product, float dbz_min_threshold,
-                          uint32_t* d_output);
+                          uint32_t* d_output,
+                          float srv_speed = 0.0f,
+                          float srv_dir = 0.0f);
 
-// Forward render: one thread per gate, rasterizes polar quads directly.
-// Skips empty gates entirely. Crisp per-gate rendering by construction.
+// Forward render: one thread per gate, rasterizes polar sectors directly.
+// Internally falls back to inverse mapping when zoom/pathology makes that
+// more correct than brute-force forward writes.
 // srv_speed/srv_dir: Storm-Relative Velocity params (0 = disabled)
 void forwardRenderStation(const GpuViewport& vp,
                            int station_idx,

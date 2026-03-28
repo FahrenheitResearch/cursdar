@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 #ifndef M_PI
@@ -30,6 +31,16 @@ static GpuStationInfo*  d_stationInfoBuf = nullptr;
 static GpuStationPtrs*  d_stationPtrsBuf = nullptr;
 static int              d_bufSize = 0;
 
+// Persistent buffers for grid construction
+static GpuStationInfo* d_gridStationsBuf = nullptr;
+static uint8_t*        d_gridActiveBuf = nullptr;
+static SpatialGrid*    d_gridBuildBuf = nullptr;
+static int             d_gridBuildCapacity = 0;
+
+// Deterministic forward-render accumulation buffer
+static uint64_t* d_forwardAccumBuf = nullptr;
+static size_t    d_forwardAccumCapacity = 0;
+
 // Host-side pointer tracking
 static GpuStationPtrs h_stationPtrs[MAX_STATIONS] = {};
 
@@ -37,6 +48,69 @@ static GpuStationPtrs h_stationPtrs[MAX_STATIONS] = {};
 
 __device__ __host__ static uint32_t makeRGBA(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) {
     return (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16) | ((uint32_t)a << 24);
+}
+
+constexpr uint32_t kBackgroundColor = 0xFF140F0Fu;
+constexpr uint64_t kEmptyForwardPixel = ~0ull;
+
+__device__ __host__ static float angleDiffDeg(float a, float b) {
+    float d = fabsf(a - b);
+    return (d > 180.0f) ? (360.0f - d) : d;
+}
+
+__device__ __host__ static float positiveAngleDeltaDeg(float from, float to) {
+    float d = to - from;
+    if (d < 0.0f) d += 360.0f;
+    return d;
+}
+
+__device__ __host__ static float wrapAngleDeg(float angle) {
+    while (angle < 0.0f) angle += 360.0f;
+    while (angle >= 360.0f) angle -= 360.0f;
+    return angle;
+}
+
+__device__ __host__ static float productThreshold(int product, float dbz_min) {
+    if (product == PROD_VEL || product == PROD_ZDR || product == PROD_KDP || product == PROD_PHI)
+        return -999.0f;
+    if (product == PROD_CC) return 0.3f;
+    if (product == PROD_SW) return 0.5f;
+    return dbz_min;
+}
+
+__device__ __host__ static void productColorRange(int product, float& min_val, float& max_val) {
+    switch (product) {
+        case PROD_REF: min_val = -30.0f; max_val = 75.0f; break;
+        case PROD_VEL: min_val = -64.0f; max_val = 64.0f; break;
+        case PROD_SW:  min_val = 0.0f;   max_val = 30.0f; break;
+        case PROD_ZDR: min_val = -8.0f;  max_val = 8.0f; break;
+        case PROD_CC:  min_val = 0.2f;   max_val = 1.05f; break;
+        case PROD_KDP: min_val = -10.0f; max_val = 15.0f; break;
+        default:       min_val = 0.0f;   max_val = 360.0f; break;
+    }
+}
+
+__device__ __host__ static float normalizedColorCoord(float value, int product) {
+    float min_val, max_val;
+    productColorRange(product, min_val, max_val);
+    float norm = (value - min_val) / (max_val - min_val);
+    norm = fminf(fmaxf(norm, 0.0f), 1.0f);
+    return (norm * 254.0f + 1.0f) / 256.0f;
+}
+
+__device__ static uint64_t forwardDepthKey(float range_km, uint32_t rgba) {
+    uint32_t depth_m = (uint32_t)fminf(fmaxf(range_km * 1000.0f, 0.0f), 4294967294.0f);
+    return (uint64_t(depth_m) << 32) | uint64_t(rgba);
+}
+
+__device__ static void atomicMin64(uint64_t* addr, uint64_t value) {
+    unsigned long long* ptr = reinterpret_cast<unsigned long long*>(addr);
+    unsigned long long old = *ptr;
+    while (value < old) {
+        unsigned long long assumed = old;
+        old = atomicCAS(ptr, assumed, value);
+        if (old == assumed) break;
+    }
 }
 
 // Map a physical value to a color table index [0..255]
@@ -266,10 +340,8 @@ __device__ float sampleStation(
     int idx_lo = (idx_hi == 0) ? nr - 1 : idx_hi - 1;
     if (idx_hi >= nr) idx_hi = 0;
 
-    float d_lo = fabsf(az - ptrs.azimuths[idx_lo]);
-    float d_hi = fabsf(az - ptrs.azimuths[idx_hi]);
-    if (d_lo > 180.0f) d_lo = 360.0f - d_lo;
-    if (d_hi > 180.0f) d_hi = 360.0f - d_hi;
+    float d_lo = angleDiffDeg(az, ptrs.azimuths[idx_lo]);
+    float d_hi = angleDiffDeg(az, ptrs.azimuths[idx_hi]);
 
     int gi = (int)((range_km - fgkm) / gskm);
     if (gi < 0 || gi >= ng) return -999.0f;
@@ -287,13 +359,7 @@ __device__ float sampleStation(
     if (value <= -998.0f) return -999.0f;
 
     // Per-product threshold
-    float threshold = dbz_min;
-    if (product == PROD_VEL || product == PROD_ZDR || product == PROD_KDP || product == PROD_PHI)
-        threshold = -999.0f;
-    else if (product == PROD_CC) threshold = 0.3f;
-    else if (product == PROD_SW) threshold = 0.5f;
-
-    if (value < threshold) return -999.0f;
+    if (value < productThreshold(product, dbz_min)) return -999.0f;
 
     return value;
 }
@@ -330,6 +396,7 @@ __global__ void nativeRenderKernel(
     }
 
     int count = grid->counts[gy][gx];
+    if (count > MAX_STATIONS_PER_CELL) count = MAX_STATIONS_PER_CELL;
     float best_value = -999.0f;
     float best_range = 1e9f;
 
@@ -363,23 +430,9 @@ __global__ void nativeRenderKernel(
     }
 
     // Map value to color
-    float min_val, max_val;
-    switch (product) {
-        case PROD_REF: min_val = -30.0f; max_val = 75.0f; break;
-        case PROD_VEL: min_val = -64.0f; max_val = 64.0f; break;
-        case PROD_SW:  min_val = 0.0f;   max_val = 30.0f; break;
-        case PROD_ZDR: min_val = -8.0f;  max_val = 8.0f;  break;
-        case PROD_CC:  min_val = 0.2f;   max_val = 1.05f;  break;
-        case PROD_KDP: min_val = -10.0f; max_val = 15.0f; break;
-        default:       min_val = 0.0f;   max_val = 360.0f; break;
-    }
-
-    float norm = (best_value - min_val) / (max_val - min_val);
-    norm = fminf(fmaxf(norm, 0.0f), 1.0f);
-
     // Hardware-interpolated texture lookup (float4 RGBA, normalized coords)
     // Offset to skip index 0 (transparent) and use indices 1-255
-    float tex_coord = (norm * 254.0f + 1.0f) / 256.0f;
+    float tex_coord = normalizedColorCoord(best_value, product);
     float4 tc = tex1D<float4>(colorTex, tex_coord);
 
     if (tc.w < 0.01f) {
@@ -399,6 +452,95 @@ __global__ void nativeRenderKernel(
 
 // ── API ─────────────────────────────────────────────────────
 
+static void ensureStationDeviceCapacity(GpuStationBuffers& buf, const GpuStationInfo& info) {
+    if (!buf.allocated) {
+        CUDA_CHECK(cudaStreamCreate(&buf.stream));
+        buf.allocated = true;
+    }
+
+    if (info.num_radials > buf.azimuth_capacity) {
+        if (buf.d_azimuths) CUDA_CHECK(cudaFree(buf.d_azimuths));
+        CUDA_CHECK(cudaMalloc(&buf.d_azimuths, size_t(info.num_radials) * sizeof(float)));
+        buf.azimuth_capacity = info.num_radials;
+    }
+
+    for (int p = 0; p < NUM_PRODUCTS; p++) {
+        size_t needed = 0;
+        if (info.has_product[p] && info.num_gates[p] > 0 && info.num_radials > 0)
+            needed = size_t(info.num_gates[p]) * size_t(info.num_radials) * sizeof(uint16_t);
+        if (needed > buf.gate_capacity_bytes[p]) {
+            if (buf.d_gates[p]) CUDA_CHECK(cudaFree(buf.d_gates[p]));
+            CUDA_CHECK(cudaMalloc(&buf.d_gates[p], needed));
+            buf.gate_capacity_bytes[p] = needed;
+        }
+    }
+}
+
+static void ensureStationPinnedCapacity(GpuStationBuffers& buf, size_t azimuth_bytes,
+                                        const GpuStationInfo& info) {
+    if (azimuth_bytes > buf.h_azimuth_capacity_bytes) {
+        if (buf.h_azimuths) CUDA_CHECK(cudaFreeHost(buf.h_azimuths));
+        CUDA_CHECK(cudaMallocHost(&buf.h_azimuths, azimuth_bytes));
+        buf.h_azimuth_capacity_bytes = azimuth_bytes;
+    }
+
+    for (int p = 0; p < NUM_PRODUCTS; p++) {
+        size_t needed = 0;
+        if (info.has_product[p] && info.num_gates[p] > 0 && info.num_radials > 0)
+            needed = size_t(info.num_gates[p]) * size_t(info.num_radials) * sizeof(uint16_t);
+        if (needed > buf.h_gate_capacity_bytes[p]) {
+            if (buf.h_gates[p]) CUDA_CHECK(cudaFreeHost(buf.h_gates[p]));
+            CUDA_CHECK(cudaMallocHost(&buf.h_gates[p], needed));
+            buf.h_gate_capacity_bytes[p] = needed;
+        }
+    }
+}
+
+static void ensureGridBuildCapacity(int num_stations) {
+    if (num_stations <= d_gridBuildCapacity) return;
+
+    if (d_gridStationsBuf) CUDA_CHECK(cudaFree(d_gridStationsBuf));
+    if (d_gridActiveBuf) CUDA_CHECK(cudaFree(d_gridActiveBuf));
+
+    CUDA_CHECK(cudaMalloc(&d_gridStationsBuf, size_t(num_stations) * sizeof(GpuStationInfo)));
+    CUDA_CHECK(cudaMalloc(&d_gridActiveBuf, size_t(num_stations) * sizeof(uint8_t)));
+    d_gridBuildCapacity = num_stations;
+}
+
+static void ensureForwardAccumCapacity(size_t pixel_count) {
+    if (pixel_count <= d_forwardAccumCapacity) return;
+    if (d_forwardAccumBuf) CUDA_CHECK(cudaFree(d_forwardAccumBuf));
+    CUDA_CHECK(cudaMalloc(&d_forwardAccumBuf, pixel_count * sizeof(uint64_t)));
+    d_forwardAccumCapacity = pixel_count;
+}
+
+static bool shouldUseInverseFallback(const GpuViewport& vp,
+                                     const GpuStationInfo& info,
+                                     int product) {
+    if (product < 0 || product >= NUM_PRODUCTS || info.num_radials <= 0)
+        return true;
+
+    float gskm = info.gate_spacing_km[product];
+    if (gskm <= 0.0f) return true;
+
+    float cos_lat = cosf(info.lat * (float)M_PI / 180.0f);
+    cos_lat = fmaxf(cos_lat, 0.1f);
+
+    float km_per_px_x = fabsf(vp.deg_per_pixel_x) * 111.0f * cos_lat;
+    float km_per_px_y = fabsf(vp.deg_per_pixel_y) * 111.0f;
+    if (km_per_px_x <= 0.0f || km_per_px_y <= 0.0f) return false;
+
+    float px_per_km = 1.0f / fminf(km_per_px_x, km_per_px_y);
+    float gate_depth_px = gskm * px_per_km;
+    float nominal_span_rad = (2.0f * (float)M_PI) / fmaxf((float)info.num_radials, 1.0f);
+    float sample_range_km = fmaxf(info.first_gate_km[product] + 8.0f * gskm, 20.0f);
+    float beam_width_px = sample_range_km * nominal_span_rad * px_per_km;
+
+    return gate_depth_px > 48.0f ||
+           beam_width_px > 48.0f ||
+           (gate_depth_px * fmaxf(beam_width_px, 1.0f)) > 2048.0f;
+}
+
 namespace gpu {
 
 void init() {
@@ -415,6 +557,8 @@ void init() {
 
     CUDA_CHECK(cudaMalloc(&d_spatialGrid, sizeof(SpatialGrid)));
     memset(h_stationPtrs, 0, sizeof(h_stationPtrs));
+    memset(s_stationInfo, 0, sizeof(s_stationInfo));
+    memset(s_stationBufs, 0, sizeof(s_stationBufs));
     s_numStations = 0;
     printf("GPU renderer initialized (native-res mode).\n");
 }
@@ -424,7 +568,13 @@ void shutdown() {
     if (d_spatialGrid) { cudaFree(d_spatialGrid); d_spatialGrid = nullptr; }
     if (d_stationInfoBuf) { cudaFree(d_stationInfoBuf); d_stationInfoBuf = nullptr; }
     if (d_stationPtrsBuf) { cudaFree(d_stationPtrsBuf); d_stationPtrsBuf = nullptr; }
+    if (d_gridStationsBuf) { cudaFree(d_gridStationsBuf); d_gridStationsBuf = nullptr; }
+    if (d_gridActiveBuf) { cudaFree(d_gridActiveBuf); d_gridActiveBuf = nullptr; }
+    if (d_gridBuildBuf) { cudaFree(d_gridBuildBuf); d_gridBuildBuf = nullptr; }
+    if (d_forwardAccumBuf) { cudaFree(d_forwardAccumBuf); d_forwardAccumBuf = nullptr; }
     d_bufSize = 0;
+    d_gridBuildCapacity = 0;
+    d_forwardAccumCapacity = 0;
     // Destroy color texture objects
     if (s_colorTexturesCreated) {
         for (int p = 0; p < NUM_PRODUCTS; p++) {
@@ -438,22 +588,8 @@ void shutdown() {
 void allocateStation(int idx, const GpuStationInfo& info) {
     if (idx < 0 || idx >= MAX_STATIONS) return;
     auto& buf = s_stationBufs[idx];
-    if (buf.allocated) freeStation(idx);
-
     s_stationInfo[idx] = info;
-    CUDA_CHECK(cudaStreamCreate(&buf.stream));
-    CUDA_CHECK(cudaMalloc(&buf.d_azimuths, info.num_radials * sizeof(float)));
-
-    for (int p = 0; p < NUM_PRODUCTS; p++) {
-        if (info.has_product[p] && info.num_gates[p] > 0) {
-            size_t sz = (size_t)info.num_gates[p] * info.num_radials * sizeof(uint16_t);
-            CUDA_CHECK(cudaMalloc(&buf.d_gates[p], sz));
-        } else {
-            buf.d_gates[p] = nullptr;
-        }
-    }
-
-    buf.allocated = true;
+    ensureStationDeviceCapacity(buf, info);
 
     // Track device pointers
     h_stationPtrs[idx].azimuths = buf.d_azimuths;
@@ -468,14 +604,18 @@ void freeStation(int idx) {
     auto& buf = s_stationBufs[idx];
     if (!buf.allocated) return;
 
-    cudaStreamSynchronize(buf.stream);
-    cudaStreamDestroy(buf.stream);
-    cudaFree(buf.d_azimuths);
+    CUDA_CHECK(cudaStreamSynchronize(buf.stream));
+    CUDA_CHECK(cudaStreamDestroy(buf.stream));
+    if (buf.d_azimuths) CUDA_CHECK(cudaFree(buf.d_azimuths));
     for (int p = 0; p < NUM_PRODUCTS; p++)
-        if (buf.d_gates[p]) cudaFree(buf.d_gates[p]);
+        if (buf.d_gates[p]) CUDA_CHECK(cudaFree(buf.d_gates[p]));
+    if (buf.h_azimuths) CUDA_CHECK(cudaFreeHost(buf.h_azimuths));
+    for (int p = 0; p < NUM_PRODUCTS; p++)
+        if (buf.h_gates[p]) CUDA_CHECK(cudaFreeHost(buf.h_gates[p]));
 
     memset(&h_stationPtrs[idx], 0, sizeof(GpuStationPtrs));
     memset(&buf, 0, sizeof(buf));
+    memset(&s_stationInfo[idx], 0, sizeof(GpuStationInfo));
 }
 
 void uploadStationData(int idx, const GpuStationInfo& info,
@@ -486,32 +626,27 @@ void uploadStationData(int idx, const GpuStationInfo& info,
     if (!buf.allocated) return;
 
     s_stationInfo[idx] = info;
+    ensureStationDeviceCapacity(buf, info);
 
-    // Use pinned staging buffer for TRUE async transfer (2x bandwidth)
-    // Without pinned memory, cudaMemcpyAsync silently blocks.
     size_t az_size = info.num_radials * sizeof(float);
-    float* pinned_az;
-    CUDA_CHECK(cudaMallocHost(&pinned_az, az_size));
-    memcpy(pinned_az, azimuths, az_size);
-    CUDA_CHECK(cudaMemcpyAsync(buf.d_azimuths, pinned_az, az_size,
-                                cudaMemcpyHostToDevice, buf.stream));
+    ensureStationPinnedCapacity(buf, az_size, info);
 
-    uint8_t* pinned_gates[NUM_PRODUCTS] = {};
+    if (az_size > 0) {
+        memcpy(buf.h_azimuths, azimuths, az_size);
+        CUDA_CHECK(cudaMemcpyAsync(buf.d_azimuths, buf.h_azimuths, az_size,
+                                    cudaMemcpyHostToDevice, buf.stream));
+    }
+
     for (int p = 0; p < NUM_PRODUCTS; p++) {
         if (info.has_product[p] && gate_data[p] && buf.d_gates[p]) {
             size_t sz = (size_t)info.num_gates[p] * info.num_radials * sizeof(uint16_t);
-            CUDA_CHECK(cudaMallocHost(&pinned_gates[p], sz));
-            memcpy(pinned_gates[p], gate_data[p], sz);
-            CUDA_CHECK(cudaMemcpyAsync(buf.d_gates[p], pinned_gates[p], sz,
+            memcpy(buf.h_gates[p], gate_data[p], sz);
+            CUDA_CHECK(cudaMemcpyAsync(buf.d_gates[p], buf.h_gates[p], sz,
                                         cudaMemcpyHostToDevice, buf.stream));
         }
     }
 
-    // Sync then free pinned staging buffers
     CUDA_CHECK(cudaStreamSynchronize(buf.stream));
-    cudaFreeHost(pinned_az);
-    for (int p = 0; p < NUM_PRODUCTS; p++)
-        if (pinned_gates[p]) cudaFreeHost(pinned_gates[p]);
 
     h_stationPtrs[idx].azimuths = buf.d_azimuths;
     for (int p = 0; p < NUM_PRODUCTS; p++)
@@ -565,6 +700,8 @@ __global__ void singleStationKernel(
     int product,
     float dbz_min,
     cudaTextureObject_t colorTex,
+    float srv_speed,
+    float srv_dir_rad,
     uint32_t* __restrict__ output)
 {
     int px = blockIdx.x * blockDim.x + threadIdx.x;
@@ -574,7 +711,7 @@ __global__ void singleStationKernel(
     float lon = vp.center_lon + (px - vp.width * 0.5f) * vp.deg_per_pixel_x;
     float lat = vp.center_lat - (py - vp.height * 0.5f) * vp.deg_per_pixel_y;
 
-    uint32_t bg = makeRGBA(15, 15, 20, 255);
+    uint32_t bg = kBackgroundColor;
 
     if (!gates) { output[py * vp.width + px] = bg; return; }
 
@@ -612,10 +749,8 @@ __global__ void singleStationKernel(
     int idx_lo = (idx_hi == 0) ? nr - 1 : idx_hi - 1;
     if (idx_hi >= nr) idx_hi = 0;
 
-    float d_lo = fabsf(az - s_az[idx_lo]);
-    float d_hi = fabsf(az - s_az[idx_hi]);
-    if (d_lo > 180.0f) d_lo = 360.0f - d_lo;
-    if (d_hi > 180.0f) d_hi = 360.0f - d_hi;
+    float d_lo = angleDiffDeg(az, s_az[idx_lo]);
+    float d_hi = angleDiffDeg(az, s_az[idx_hi]);
 
     // Nearest gate
     int gi = (int)((range_km - fgkm) / gskm);
@@ -632,29 +767,18 @@ __global__ void singleStationKernel(
     float sc = info.scale[product], off = info.offset[product];
     float value = ((float)raw - off) / sc;
 
+    if (srv_speed > 0.0f && product == PROD_VEL) {
+        float az_rad = s_az[ri_first] * ((float)M_PI / 180.0f);
+        value -= srv_speed * cosf(az_rad - srv_dir_rad);
+    }
+
     if (value <= -998.0f) { output[py * vp.width + px] = bg; return; }
 
     // Threshold
-    float threshold = dbz_min;
-    if (product == PROD_VEL || product == PROD_ZDR || product == PROD_KDP || product == PROD_PHI)
-        threshold = -999.0f;
-    else if (product == PROD_CC) threshold = 0.3f;
-    else if (product == PROD_SW) threshold = 0.5f;
-    if (value < threshold) { output[py * vp.width + px] = bg; return; }
+    if (value < productThreshold(product, dbz_min)) { output[py * vp.width + px] = bg; return; }
 
     // Color via HW texture
-    float min_val, max_val;
-    switch (product) {
-        case PROD_REF: min_val=-30;max_val=75; break;
-        case PROD_VEL: min_val=-64;max_val=64; break;
-        case PROD_SW:  min_val=0;max_val=30; break;
-        case PROD_ZDR: min_val=-8;max_val=8; break;
-        case PROD_CC:  min_val=0.2f;max_val=1.05f; break;
-        case PROD_KDP: min_val=-10;max_val=15; break;
-        default:       min_val=0;max_val=360; break;
-    }
-    float norm = fminf(fmaxf((value - min_val) / (max_val - min_val), 0.0f), 1.0f);
-    float tc_coord = (norm * 254.0f + 1.0f) / 256.0f;
+    float tc_coord = normalizedColorCoord(value, product);
     float4 tc = tex1D<float4>(colorTex, tc_coord);
 
     if (tc.w < 0.01f) { output[py * vp.width + px] = bg; return; }
@@ -666,12 +790,33 @@ __global__ void singleStationKernel(
         (uint8_t)(bb*(1-tc.w) + tc.z*255*tc.w), 255);
 }
 
-void renderSingleStation(const GpuViewport& vp, int station_idx,
-                          int product, float dbz_min, uint32_t* d_output) {
-    if (station_idx < 0 || station_idx >= MAX_STATIONS) return;
+__global__ void clearKernel(uint32_t* output, int width, int height, uint32_t color) {
+    int px = blockIdx.x * blockDim.x + threadIdx.x;
+    int py = blockIdx.y * blockDim.y + threadIdx.y;
+    if (px < width && py < height)
+        output[py * width + px] = color;
+}
+
+static void clearOutputBuffer(const GpuViewport& vp, uint32_t* d_output) {
+    dim3 block(32, 8);
+    dim3 grid((vp.width + 31) / 32, (vp.height + 7) / 8);
+    clearKernel<<<grid, block>>>(d_output, vp.width, vp.height, kBackgroundColor);
+}
+
+static void renderSingleStationInternal(const GpuViewport& vp, int station_idx,
+                                        int product, float dbz_min,
+                                        uint32_t* d_output,
+                                        float srv_speed, float srv_dir_deg) {
+    if (station_idx < 0 || station_idx >= MAX_STATIONS) {
+        clearOutputBuffer(vp, d_output);
+        return;
+    }
     auto& buf = s_stationBufs[station_idx];
     auto& info = s_stationInfo[station_idx];
-    if (!buf.allocated || !info.has_product[product] || !buf.d_gates[product]) return;
+    if (!buf.allocated || !info.has_product[product] || !buf.d_gates[product]) {
+        clearOutputBuffer(vp, d_output);
+        return;
+    }
 
     dim3 block(16, 16);
     dim3 grid((vp.width + 15) / 16, (vp.height + 15) / 16);
@@ -681,11 +826,19 @@ void renderSingleStation(const GpuViewport& vp, int station_idx,
 
     singleStationKernel<<<grid, block, shared>>>(
         vp, info, buf.d_azimuths, buf.d_gates[product],
-        product, dbz_min, s_colorTextures[product], d_output);
+        product, dbz_min, s_colorTextures[product],
+        srv_speed, srv_dir_deg * (float)M_PI / 180.0f,
+        d_output);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
         fprintf(stderr, "Single station render error: %s\n", cudaGetErrorString(err));
+}
+
+void renderSingleStation(const GpuViewport& vp, int station_idx,
+                          int product, float dbz_min, uint32_t* d_output,
+                          float srv_speed, float srv_dir) {
+    renderSingleStationInternal(vp, station_idx, product, dbz_min, d_output, srv_speed, srv_dir);
 }
 
 // ── Forward Render Kernel ────────────────────────────────────
@@ -706,6 +859,42 @@ __device__ float2 polarToScreen(float range_km, float az_rad,
     return make_float2(px, py);
 }
 
+__device__ float radialBoundaryStartDeg(const float* azimuths, int nr, int ri) {
+    float curr = __ldg(&azimuths[ri]);
+    float prev = __ldg(&azimuths[(ri + nr - 1) % nr]);
+    float nominal = 360.0f / fmaxf((float)nr, 1.0f);
+    float min_half = fmaxf(0.25f * nominal, 0.05f);
+    float max_half = fmaxf(2.0f * nominal, 1.0f);
+    float half_gap = 0.5f * positiveAngleDeltaDeg(prev, curr);
+    half_gap = fminf(fmaxf(half_gap, min_half), max_half);
+    return wrapAngleDeg(curr - half_gap);
+}
+
+__device__ float radialBoundaryEndDeg(const float* azimuths, int nr, int ri) {
+    float curr = __ldg(&azimuths[ri]);
+    float next = __ldg(&azimuths[(ri + 1) % nr]);
+    float nominal = 360.0f / fmaxf((float)nr, 1.0f);
+    float min_half = fmaxf(0.25f * nominal, 0.05f);
+    float max_half = fmaxf(2.0f * nominal, 1.0f);
+    float half_gap = 0.5f * positiveAngleDeltaDeg(curr, next);
+    half_gap = fminf(fmaxf(half_gap, min_half), max_half);
+    return wrapAngleDeg(curr + half_gap);
+}
+
+__device__ bool pointInConvexQuad(const float2 corners[4], float px, float py) {
+    bool saw_pos = false;
+    bool saw_neg = false;
+    for (int e = 0; e < 4; e++) {
+        float2 a = corners[e];
+        float2 b = corners[(e + 1) & 3];
+        float cross = (b.x - a.x) * (py - a.y) - (b.y - a.y) * (px - a.x);
+        saw_pos |= (cross > 0.01f);
+        saw_neg |= (cross < -0.01f);
+        if (saw_pos && saw_neg) return false;
+    }
+    return true;
+}
+
 __global__ void forwardRenderKernel(
     const float* __restrict__ azimuths,
     const uint16_t* __restrict__ gates,
@@ -714,7 +903,7 @@ __global__ void forwardRenderKernel(
     int product, float dbz_min,
     cudaTextureObject_t colorTex,
     float srv_speed, float srv_dir_rad, // SRV: storm motion (0 = disabled)
-    uint32_t* __restrict__ output)
+    uint64_t* __restrict__ accum)
 {
     int ri = blockIdx.x * blockDim.x + threadIdx.x;
     int gi = blockIdx.y * blockDim.y + threadIdx.y;
@@ -736,43 +925,17 @@ __global__ void forwardRenderKernel(
         value -= srv_speed * cosf(az_rad - srv_dir_rad);
     }
 
-    // Threshold
-    float threshold = dbz_min;
-    if (product == PROD_VEL || product == PROD_ZDR || product == PROD_KDP || product == PROD_PHI)
-        threshold = -999.0f;
-    else if (product == PROD_CC) threshold = 0.3f;
-    else if (product == PROD_SW) threshold = 0.5f;
-    if (value < threshold) return;
+    if (value <= -998.0f || value < productThreshold(product, dbz_min)) return;
 
     // Color lookup
-    float min_val, max_val;
-    switch (product) {
-        case PROD_REF: min_val=-30;max_val=75; break;
-        case PROD_VEL: min_val=-64;max_val=64; break;
-        case PROD_SW:  min_val=0;max_val=30; break;
-        case PROD_ZDR: min_val=-8;max_val=8; break;
-        case PROD_CC:  min_val=0.2f;max_val=1.05f; break;
-        case PROD_KDP: min_val=-10;max_val=15; break;
-        default:       min_val=0;max_val=360; break;
-    }
-    float norm = fminf(fmaxf((value - min_val) / (max_val - min_val), 0.0f), 1.0f);
-    float tc = (norm * 254.0f + 1.0f) / 256.0f;
+    float tc = normalizedColorCoord(value, product);
     float4 col = tex1D<float4>(colorTex, tc);
     if (col.w < 0.01f) return;
     uint32_t rgba = makeRGBA((uint8_t)(col.x*255), (uint8_t)(col.y*255),
                               (uint8_t)(col.z*255), 255);
 
-    // Compute 4 corners of this polar quad in screen space
-    int ri_next = (ri + 1) % nr;
-    float az0_deg = __ldg(&azimuths[ri]);
-    float az1_deg = __ldg(&azimuths[ri_next]);
-    // Handle 360->0 wraparound: skip this gate if angular gap > 5 degrees
-    float az_gap = az1_deg - az0_deg;
-    if (az_gap < -180.0f) az_gap += 360.0f;
-    if (az_gap > 180.0f) az_gap -= 360.0f;
-    if (fabsf(az_gap) > 5.0f) return; // degenerate wrap-around quad
-    float az0 = az0_deg * ((float)M_PI / 180.0f);
-    float az1 = az1_deg * ((float)M_PI / 180.0f);
+    float az0 = radialBoundaryStartDeg(azimuths, nr, ri) * ((float)M_PI / 180.0f);
+    float az1 = radialBoundaryEndDeg(azimuths, nr, ri) * ((float)M_PI / 180.0f);
     float gskm = info.gate_spacing_km[product];
     float r0 = info.first_gate_km[product] + gi * gskm;
     float r1 = r0 + gskm;
@@ -788,59 +951,57 @@ __global__ void forwardRenderKernel(
     int iy0 = max(0, (int)floorf(fminf(fminf(c0.y, c1.y), fminf(c2.y, c3.y))));
     int iy1 = min(vp.height - 1, (int)ceilf(fmaxf(fmaxf(c0.y, c1.y), fmaxf(c2.y, c3.y))));
 
-    // Skip if entirely off-screen or degenerate (too many pixels = bad quad)
     if (ix0 > ix1 || iy0 > iy1) return;
-    if ((ix1 - ix0) * (iy1 - iy0) > 10000) return; // cap fill area
 
-    // Edge functions for convex quad (CCW winding in screen space)
-    // Screen space is Y-down, so reverse order for CCW
-    float2 corners[4] = {c0, c3, c2, c1};
-    float enx[4], eny[4], ed[4];
-    for (int e = 0; e < 4; e++) {
-        float2 v0 = corners[e];
-        float2 v1 = corners[(e + 1) & 3];
-        enx[e] = v1.y - v0.y;
-        eny[e] = -(v1.x - v0.x);
-        ed[e] = enx[e] * v0.x + eny[e] * v0.y;
-    }
+    float2 corners[4] = {c0, c1, c2, c3};
+    uint64_t candidate = forwardDepthKey(r0 + 0.5f * gskm, rgba);
 
-    // Fill all pixels inside the quad
     for (int py = iy0; py <= iy1; py++) {
         for (int px = ix0; px <= ix1; px++) {
             float fx = (float)px + 0.5f;
             float fy = (float)py + 0.5f;
-            bool inside = true;
-            for (int e = 0; e < 4; e++) {
-                if (enx[e] * fx + eny[e] * fy < ed[e]) { inside = false; break; }
-            }
-            if (inside) {
-                output[py * vp.width + px] = rgba;
-            }
+            if (pointInConvexQuad(corners, fx, fy))
+                atomicMin64(&accum[py * vp.width + px], candidate);
         }
     }
 }
 
-// Clear kernel (fills background)
-__global__ void clearKernel(uint32_t* output, int width, int height, uint32_t color) {
+__global__ void forwardResolveKernel(const uint64_t* __restrict__ accum,
+                                     int width, int height,
+                                     uint32_t* __restrict__ output) {
     int px = blockIdx.x * blockDim.x + threadIdx.x;
     int py = blockIdx.y * blockDim.y + threadIdx.y;
-    if (px < width && py < height)
-        output[py * width + px] = color;
+    if (px >= width || py >= height) return;
+
+    uint64_t packed = accum[py * width + px];
+    output[py * width + px] = (packed == kEmptyForwardPixel)
+        ? kBackgroundColor
+        : uint32_t(packed & 0xFFFFFFFFu);
 }
 
 void forwardRenderStation(const GpuViewport& vp, int station_idx,
                            int product, float dbz_min, uint32_t* d_output,
                            float srv_speed, float srv_dir) {
-    if (station_idx < 0 || station_idx >= MAX_STATIONS) return;
+    if (station_idx < 0 || station_idx >= MAX_STATIONS) {
+        clearOutputBuffer(vp, d_output);
+        return;
+    }
     auto& buf = s_stationBufs[station_idx];
     auto& info = s_stationInfo[station_idx];
-    if (!buf.allocated || !info.has_product[product] || !buf.d_gates[product]) return;
+    if (!buf.allocated || !info.has_product[product] || !buf.d_gates[product]) {
+        clearOutputBuffer(vp, d_output);
+        return;
+    }
 
-    // Clear to background first
-    dim3 clearBlock(32, 8);
-    dim3 clearGrid((vp.width + 31) / 32, (vp.height + 7) / 8);
-    clearKernel<<<clearGrid, clearBlock>>>(d_output, vp.width, vp.height,
-                                            makeRGBA(15, 15, 20, 255));
+    if (shouldUseInverseFallback(vp, info, product)) {
+        renderSingleStationInternal(vp, station_idx, product, dbz_min,
+                                    d_output, srv_speed, srv_dir);
+        return;
+    }
+
+    size_t pixel_count = size_t(vp.width) * size_t(vp.height);
+    ensureForwardAccumCapacity(pixel_count);
+    CUDA_CHECK(cudaMemsetAsync(d_forwardAccumBuf, 0xFF, pixel_count * sizeof(uint64_t)));
 
     // Forward render: one thread per (radial, gate)
     dim3 block(32, 8); // 256 threads, warp-aligned
@@ -853,7 +1014,13 @@ void forwardRenderStation(const GpuViewport& vp, int station_idx,
         info, vp, product, dbz_min,
         s_colorTextures[product],
         srv_speed, srv_dir_rad,
-        d_output);
+        d_forwardAccumBuf);
+
+    dim3 resolveBlock(32, 8);
+    dim3 resolveGrid((vp.width + 31) / 32, (vp.height + 7) / 8);
+    forwardResolveKernel<<<resolveGrid, resolveBlock>>>(d_forwardAccumBuf,
+                                                        vp.width, vp.height,
+                                                        d_output);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
@@ -899,7 +1066,7 @@ uint16_t* getStationGates(int idx, int product) {
 
 __global__ void buildGridKernel(
     const GpuStationInfo* __restrict__ stations,
-    const bool* __restrict__ active,   // which stations have data
+    const uint8_t* __restrict__ active,   // which stations have data
     int num_stations,
     SpatialGrid* __restrict__ grid)
 {
@@ -921,9 +1088,15 @@ __global__ void buildGridKernel(
 
     for (int gy = gy_min; gy <= gy_max; gy++) {
         for (int gx = gx_min; gx <= gx_max; gx++) {
-            int slot = atomicAdd(&grid->counts[gy][gx], 1);
-            if (slot < MAX_STATIONS_PER_CELL) {
-                grid->cells[gy][gx][slot] = si;
+            int* count = &grid->counts[gy][gx];
+            int slot = atomicAdd(count, 0);
+            while (slot < MAX_STATIONS_PER_CELL) {
+                int old = atomicCAS(count, slot, slot + 1);
+                if (old == slot) {
+                    grid->cells[gy][gx][slot] = si;
+                    break;
+                }
+                slot = old;
             }
         }
     }
@@ -931,42 +1104,49 @@ __global__ void buildGridKernel(
 
 void buildSpatialGridGpu(const GpuStationInfo* h_stations, int num_stations,
                           SpatialGrid* h_grid_out) {
-    // Upload station info
-    GpuStationInfo* d_stations;
-    bool* d_active;
-    CUDA_CHECK(cudaMalloc(&d_stations, num_stations * sizeof(GpuStationInfo)));
-    CUDA_CHECK(cudaMalloc(&d_active, num_stations * sizeof(bool)));
-    CUDA_CHECK(cudaMemcpy(d_stations, h_stations,
+    if (!h_grid_out) return;
+    if (num_stations <= 0 || !h_stations) {
+        SpatialGrid empty = {};
+        empty.min_lat = 15.0f;
+        empty.max_lat = 72.0f;
+        empty.min_lon = -180.0f;
+        empty.max_lon = -60.0f;
+        for (int gy = 0; gy < SPATIAL_GRID_H; gy++)
+            for (int gx = 0; gx < SPATIAL_GRID_W; gx++)
+                for (int s = 0; s < MAX_STATIONS_PER_CELL; s++)
+                    empty.cells[gy][gx][s] = -1;
+        *h_grid_out = empty;
+        return;
+    }
+
+    ensureGridBuildCapacity(num_stations);
+    if (!d_gridBuildBuf)
+        CUDA_CHECK(cudaMalloc(&d_gridBuildBuf, sizeof(SpatialGrid)));
+
+    CUDA_CHECK(cudaMemcpy(d_gridStationsBuf, h_stations,
                            num_stations * sizeof(GpuStationInfo), cudaMemcpyHostToDevice));
 
     // Build active flags (station has data if num_radials > 0)
     std::vector<uint8_t> h_active(num_stations);
     for (int i = 0; i < num_stations; i++)
         h_active[i] = (h_stations[i].num_radials > 0) ? 1 : 0;
-    CUDA_CHECK(cudaMemcpy(d_active, h_active.data(), num_stations * sizeof(bool),
+    CUDA_CHECK(cudaMemcpy(d_gridActiveBuf, h_active.data(), num_stations * sizeof(uint8_t),
                            cudaMemcpyHostToDevice));
 
-    // Init grid on device
-    SpatialGrid* d_grid;
-    CUDA_CHECK(cudaMalloc(&d_grid, sizeof(SpatialGrid)));
-
-    // Set grid bounds and zero counts
     SpatialGrid init_grid = {};
     init_grid.min_lat = 15.0f;  init_grid.max_lat = 72.0f;
     init_grid.min_lon = -180.0f; init_grid.max_lon = -60.0f;
-    CUDA_CHECK(cudaMemcpy(d_grid, &init_grid, sizeof(SpatialGrid), cudaMemcpyHostToDevice));
+    for (int gy = 0; gy < SPATIAL_GRID_H; gy++)
+        for (int gx = 0; gx < SPATIAL_GRID_W; gx++)
+            for (int s = 0; s < MAX_STATIONS_PER_CELL; s++)
+                init_grid.cells[gy][gx][s] = -1;
+    CUDA_CHECK(cudaMemcpy(d_gridBuildBuf, &init_grid, sizeof(SpatialGrid), cudaMemcpyHostToDevice));
 
-    // Launch kernel
     buildGridKernel<<<(num_stations + 255) / 256, 256>>>(
-        d_stations, d_active, num_stations, d_grid);
-    CUDA_CHECK(cudaDeviceSynchronize());
+        d_gridStationsBuf, d_gridActiveBuf, num_stations, d_gridBuildBuf);
+    CUDA_CHECK(cudaGetLastError());
 
-    // Copy result back
-    CUDA_CHECK(cudaMemcpy(h_grid_out, d_grid, sizeof(SpatialGrid), cudaMemcpyDeviceToHost));
-
-    cudaFree(d_stations);
-    cudaFree(d_active);
-    cudaFree(d_grid);
+    CUDA_CHECK(cudaMemcpy(h_grid_out, d_gridBuildBuf, sizeof(SpatialGrid), cudaMemcpyDeviceToHost));
 }
 
 } // namespace gpu

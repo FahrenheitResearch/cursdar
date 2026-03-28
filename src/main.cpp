@@ -78,16 +78,19 @@ int main(int argc, char** argv) {
 
     ui::init();
 
+    int exitCode = 0;
+
     // ── App init ────────────────────────────────────────────
+    {
     App app;
     g_app = &app;
 
     if (!app.init(winW, winH)) {
         fprintf(stderr, "Failed to initialize app\n");
-        return 1;
-    }
-
-    printf("Starting main loop...\n");
+        g_app = nullptr;
+        exitCode = 1;
+    } else {
+        printf("Starting main loop...\n");
 
     // ── Main loop ───────────────────────────────────────────
     auto lastFrame = std::chrono::steady_clock::now();
@@ -191,6 +194,9 @@ int main(int argc, char** argv) {
     // ── Cleanup ─────────────────────────────────────────────
     g_app = nullptr;
     // App destructor handles GPU cleanup
+    }
+
+    }
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
@@ -200,5 +206,5 @@ int main(int argc, char** argv) {
     glfwTerminate();
 
     printf("CURSDAR shutdown complete.\n");
-    return 0;
+    return exitCode;
 }

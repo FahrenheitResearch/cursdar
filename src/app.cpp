@@ -7,12 +7,154 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <cmath>
+#include <limits>
+
+namespace {
+
+constexpr float kPi = 3.14159265f;
+constexpr float kDegToRad = kPi / 180.0f;
+constexpr float kInvalidSample = -9999.0f;
+
+float decodeGateValue(const PrecomputedSweep::ProductData& pd, int num_radials,
+                      int gate_idx, int radial_idx) {
+    if (!pd.has_data || num_radials <= 0 ||
+        gate_idx < 0 || radial_idx < 0 ||
+        gate_idx >= pd.num_gates || radial_idx >= num_radials ||
+        pd.gates.empty()) {
+        return kInvalidSample;
+    }
+
+    uint16_t raw = pd.gates[(size_t)gate_idx * num_radials + radial_idx];
+    if (raw <= 1) return kInvalidSample;
+    return ((float)raw - pd.offset) / pd.scale;
+}
+
+int gateIndexForRange(const PrecomputedSweep::ProductData& pd, float range_km) {
+    if (!pd.has_data || pd.gate_spacing_km <= 0.0f) return -1;
+    int gate_idx = (int)((range_km - pd.first_gate_km) / pd.gate_spacing_km);
+    return (gate_idx >= 0 && gate_idx < pd.num_gates) ? gate_idx : -1;
+}
+
+float markerDistanceKm(float lat1, float lon1, float lat2, float lon2) {
+    float mean_lat = 0.5f * (lat1 + lat2) * kDegToRad;
+    float dlat_km = (lat1 - lat2) * 111.0f;
+    float dlon_km = (lon1 - lon2) * 111.0f * cosf(mean_lat);
+    return sqrtf(dlat_km * dlat_km + dlon_km * dlon_km);
+}
+
+int countCandidateSupport(const std::vector<uint8_t>& mask,
+                         int nr, int ng,
+                         int ri, int gi,
+                         int radial_radius, int gate_radius) {
+    int support = 0;
+    for (int dgi = -gate_radius; dgi <= gate_radius; ++dgi) {
+        int ngi = gi + dgi;
+        if (ngi < 0 || ngi >= ng) continue;
+        for (int dri = -radial_radius; dri <= radial_radius; ++dri) {
+            int nri = (ri + dri + nr) % nr;
+            support += mask[(size_t)ngi * nr + nri] ? 1 : 0;
+        }
+    }
+    return support;
+}
+
+bool isLocalExtremum(const std::vector<float>& score,
+                    const std::vector<uint8_t>& mask,
+                    int nr, int ng,
+                    int ri, int gi,
+                    int radial_radius, int gate_radius,
+                    bool lower_is_better) {
+    const float center = score[(size_t)gi * nr + ri];
+    for (int dgi = -gate_radius; dgi <= gate_radius; ++dgi) {
+        int ngi = gi + dgi;
+        if (ngi < 0 || ngi >= ng) continue;
+        for (int dri = -radial_radius; dri <= radial_radius; ++dri) {
+            int nri = (ri + dri + nr) % nr;
+            if (ngi == gi && nri == ri) continue;
+            if (!mask[(size_t)ngi * nr + nri]) continue;
+            float neighbor = score[(size_t)ngi * nr + nri];
+            if (lower_is_better) {
+                if (neighbor < center - 0.01f) return false;
+            } else {
+                if (neighbor > center + 0.01f) return false;
+            }
+        }
+    }
+    return true;
+}
+
+void clusterMarkers(std::vector<Detection::Marker>& markers,
+                    float merge_km, size_t max_markers,
+                    bool lower_value_is_stronger = false) {
+    if (markers.empty()) return;
+
+    std::sort(markers.begin(), markers.end(),
+              [lower_value_is_stronger](const Detection::Marker& a,
+                                        const Detection::Marker& b) {
+                  return lower_value_is_stronger ? (a.value < b.value)
+                                                 : (a.value > b.value);
+              });
+
+    std::vector<Detection::Marker> clustered;
+    clustered.reserve(std::min(markers.size(), max_markers));
+    for (const auto& marker : markers) {
+        bool keep = true;
+        for (const auto& existing : clustered) {
+            if (markerDistanceKm(marker.lat, marker.lon, existing.lat, existing.lon) < merge_km) {
+                keep = false;
+                break;
+            }
+        }
+        if (keep) {
+            clustered.push_back(marker);
+            if (clustered.size() >= max_markers) break;
+        }
+    }
+    markers.swap(clustered);
+}
+
+void clusterMesoMarkers(std::vector<Detection::MesoMarker>& markers,
+                        float merge_km, size_t max_markers) {
+    if (markers.empty()) return;
+
+    std::sort(markers.begin(), markers.end(),
+              [](const Detection::MesoMarker& a, const Detection::MesoMarker& b) {
+                  return a.shear > b.shear;
+              });
+
+    std::vector<Detection::MesoMarker> clustered;
+    clustered.reserve(std::min(markers.size(), max_markers));
+    for (const auto& marker : markers) {
+        bool keep = true;
+        for (const auto& existing : clustered) {
+            if (markerDistanceKm(marker.lat, marker.lon, existing.lat, existing.lon) < merge_km) {
+                keep = false;
+                break;
+            }
+        }
+        if (keep) {
+            clustered.push_back(marker);
+            if (clustered.size() >= max_markers) break;
+        }
+    }
+    markers.swap(clustered);
+}
+
+} // namespace
 
 App::App() {}
 
 App::~App() {
     if (m_downloader) m_downloader->shutdown();
+    m_historic.cancel();
+    m_warnings.stop();
+    invalidateFrameCache(true);
+    if (m_d_xsOutput) cudaFree(m_d_xsOutput);
     if (m_d_compositeOutput) cudaFree(m_d_compositeOutput);
+    gpu::freeVolume();
+    m_xsTex.destroy();
+    m_outputTex.destroy();
     gpu::shutdown();
 }
 
@@ -183,29 +325,36 @@ void App::processDownload(int stationIdx, std::vector<uint8_t> data) {
         for (int r = 0; r < pc.num_radials; r++)
             pc.azimuths[r] = sweep.radials[r].azimuth;
 
-        // Store gate params but DON'T transpose on CPU - GPU will do it
-        for (const auto& moment : sweep.radials[0].moments) {
-            int p = moment.product_index;
-            if (p < 0 || p >= NUM_PRODUCTS) continue;
+        // Derive product layout from any radial that actually carries the moment.
+        // Radial 0 is frequently sparse or truncated and cannot define the sweep.
+        for (const auto& radial : sweep.radials) {
+            for (const auto& moment : radial.moments) {
+                int p = moment.product_index;
+                if (p < 0 || p >= NUM_PRODUCTS) continue;
+                auto& pd = pc.products[p];
+                if (!pd.has_data || moment.num_gates > pd.num_gates) {
+                    pd.has_data = true;
+                    pd.num_gates = moment.num_gates;
+                    pd.first_gate_km = moment.first_gate_m / 1000.0f;
+                    pd.gate_spacing_km = moment.gate_spacing_m / 1000.0f;
+                    pd.scale = moment.scale;
+                    pd.offset = moment.offset;
+                }
+            }
+        }
+
+        for (int p = 0; p < NUM_PRODUCTS; p++) {
             auto& pd = pc.products[p];
-            pd.has_data = true;
-            pd.num_gates = moment.num_gates;
-            pd.first_gate_km = moment.first_gate_m / 1000.0f;
-            pd.gate_spacing_km = moment.gate_spacing_m / 1000.0f;
-            pd.scale = moment.scale;
-            pd.offset = moment.offset;
+            if (!pd.has_data || pd.num_gates <= 0) continue;
 
-            // GPU transposition: pack raw gate data in radial-major order
-            // (just a flat copy, no transposition - GPU kernel will transpose)
-            int ng = pd.num_gates, nr = pc.num_radials;
-            pd.gates.resize((size_t)ng * nr, 0);
+            int ng = pd.num_gates;
+            int nr = pc.num_radials;
+            pd.gates.assign((size_t)ng * nr, 0);
 
-            // Upload in radial-major temporarily, GPU will transpose
             for (int r = 0; r < nr; r++) {
                 for (const auto& mom : sweep.radials[r].moments) {
                     if (mom.product_index != p) continue;
                     int gc = std::min((int)mom.gates.size(), ng);
-                    // Store gate-major for now (GPU expects this)
                     for (int g = 0; g < gc; g++)
                         pd.gates[(size_t)g * nr + r] = mom.gates[g];
                     break;
@@ -283,19 +432,200 @@ static int countProductSweeps(const std::vector<PrecomputedSweep>& sweeps, int p
     return (int)getBestSweeps(sweeps, product).size();
 }
 
+std::vector<StationUiState> App::stations() const {
+    std::lock_guard<std::mutex> lock(m_stationMutex);
+    std::vector<StationUiState> snapshot;
+    snapshot.reserve(m_stations.size());
+    for (const auto& st : m_stations) {
+        StationUiState ui = {};
+        ui.index = st.index;
+        ui.icao = st.icao;
+        ui.lat = st.lat;
+        ui.lon = st.lon;
+        ui.display_lat = st.gpuInfo.lat != 0.0f ? st.gpuInfo.lat : st.lat;
+        ui.display_lon = st.gpuInfo.lon != 0.0f ? st.gpuInfo.lon : st.lon;
+        ui.downloading = st.downloading;
+        ui.parsed = st.parsed;
+        ui.uploaded = st.uploaded;
+        ui.rendered = st.rendered;
+        ui.failed = st.failed;
+        ui.error = st.error;
+        ui.sweep_count = (int)st.parsedData.sweeps.size();
+        if (!st.parsedData.sweeps.empty()) {
+            ui.lowest_elev = st.parsedData.sweeps[0].elevation_angle;
+            ui.lowest_radials = (int)st.parsedData.sweeps[0].radials.size();
+        }
+        ui.detection = st.detection;
+        snapshot.push_back(std::move(ui));
+    }
+    return snapshot;
+}
+
+bool App::stationUploadMatchesSelection(const StationState& st) const {
+    return st.uploaded &&
+           st.uploaded_product == m_activeProduct &&
+           st.uploaded_tilt == m_activeTilt;
+}
+
+void App::invalidateFrameCache(bool freeMemory) {
+    if (freeMemory) {
+        for (auto& frame : m_cachedFrames) {
+            if (frame) {
+                cudaFree(frame);
+                frame = nullptr;
+            }
+        }
+    }
+    m_cachedFrameCount = 0;
+    m_cachedFrameWidth = 0;
+    m_cachedFrameHeight = 0;
+}
+
+void App::ensureCrossSectionBuffer(int width, int height) {
+    if (width <= 0 || height <= 0) return;
+    if (m_d_xsOutput &&
+        width == m_xsAllocWidth &&
+        height == m_xsAllocHeight) {
+        return;
+    }
+
+    if (m_d_xsOutput) {
+        cudaFree(m_d_xsOutput);
+        m_d_xsOutput = nullptr;
+    }
+
+    CUDA_CHECK(cudaMalloc(&m_d_xsOutput, (size_t)width * height * sizeof(uint32_t)));
+    m_xsAllocWidth = width;
+    m_xsAllocHeight = height;
+}
+
+void App::rebuildVolumeForCurrentSelection() {
+    m_volumeBuilt = false;
+    m_volumeStation = -1;
+
+    auto buildVolumeFromSweeps = [&](const std::vector<PrecomputedSweep>& sweeps,
+                                     float slat, float slon, int stationSlot) {
+        int ns = (int)sweeps.size();
+        if (ns <= 0) return;
+
+        std::vector<GpuStationInfo> sweepInfos(ns);
+        std::vector<const float*> azPtrs(ns);
+        std::vector<const uint16_t*> gatePtrs(ns);
+
+        int builtSweeps = 0;
+        for (int s = 0; s < ns && s < 30; s++) {
+            const auto& pc = sweeps[s];
+            int slot = 200 + s;
+            if (slot >= MAX_STATIONS || pc.num_radials <= 0) break;
+
+            GpuStationInfo info = {};
+            info.lat = slat;
+            info.lon = slon;
+            info.elevation_angle = pc.elevation_angle;
+            info.num_radials = pc.num_radials;
+            for (int p = 0; p < NUM_PRODUCTS; p++) {
+                const auto& pd = pc.products[p];
+                if (!pd.has_data) continue;
+                info.has_product[p] = true;
+                info.num_gates[p] = pd.num_gates;
+                info.first_gate_km[p] = pd.first_gate_km;
+                info.gate_spacing_km[p] = pd.gate_spacing_km;
+                info.scale[p] = pd.scale;
+                info.offset[p] = pd.offset;
+            }
+
+            gpu::allocateStation(slot, info);
+            const uint16_t* gp[NUM_PRODUCTS] = {};
+            for (int p = 0; p < NUM_PRODUCTS; p++) {
+                if (pc.products[p].has_data && !pc.products[p].gates.empty())
+                    gp[p] = pc.products[p].gates.data();
+            }
+            gpu::uploadStationData(slot, info, pc.azimuths.data(), gp);
+            gpu::syncStation(slot);
+
+            sweepInfos[builtSweeps] = info;
+            azPtrs[builtSweeps] = gpu::getStationAzimuths(slot);
+            gatePtrs[builtSweeps] = gpu::getStationGates(slot, m_activeProduct);
+            builtSweeps++;
+        }
+
+        if (builtSweeps <= 0) return;
+
+        gpu::buildVolume(stationSlot, m_activeProduct,
+                         sweepInfos.data(), builtSweeps,
+                         azPtrs.data(), gatePtrs.data());
+        m_volumeBuilt = true;
+        m_volumeStation = stationSlot;
+    };
+
+    if (m_historicMode) {
+        const RadarFrame* fr = m_historic.frame(m_historic.currentFrame());
+        if (fr && fr->ready && !fr->sweeps.empty())
+            buildVolumeFromSweeps(fr->sweeps, fr->station_lat, fr->station_lon, 0);
+        return;
+    }
+
+    if (m_activeStationIdx < 0 || m_activeStationIdx >= (int)m_stations.size()) return;
+
+    auto& st = m_stations[m_activeStationIdx];
+    if (!stationUploadMatchesSelection(st))
+        uploadStation(m_activeStationIdx);
+    if (!stationUploadMatchesSelection(st)) return;
+
+    if (st.precomputed.empty()) return;
+
+    float slat = st.gpuInfo.lat != 0 ? st.gpuInfo.lat : st.lat;
+    float slon = st.gpuInfo.lon != 0 ? st.gpuInfo.lon : st.lon;
+    buildVolumeFromSweeps(st.precomputed, slat, slon, m_activeStationIdx);
+}
+
+void App::refreshActiveTiltMetadata() {
+    if (m_historicMode) {
+        const RadarFrame* fr = m_historic.frame(m_historic.currentFrame());
+        if (!fr || !fr->ready || fr->sweeps.empty()) return;
+        int productTilts = countProductSweeps(fr->sweeps, m_activeProduct);
+        if (productTilts <= 0) return;
+        m_maxTilts = productTilts;
+        int sweepIdx = findProductSweep(fr->sweeps, m_activeProduct, m_activeTilt);
+        m_activeTiltAngle = fr->sweeps[sweepIdx].elevation_angle;
+        return;
+    }
+
+    if (m_activeStationIdx < 0 || m_activeStationIdx >= (int)m_stations.size()) return;
+    const auto& st = m_stations[m_activeStationIdx];
+    if (st.precomputed.empty()) return;
+
+    int productTilts = countProductSweeps(st.precomputed, m_activeProduct);
+    if (productTilts <= 0) return;
+    m_maxTilts = productTilts;
+    int sweepIdx = findProductSweep(st.precomputed, m_activeProduct, m_activeTilt);
+    m_activeTiltAngle = st.precomputed[sweepIdx].elevation_angle;
+}
+
 void App::uploadStation(int stationIdx) {
     auto& st = m_stations[stationIdx];
     if (st.precomputed.empty()) return;
 
     // Filter sweeps by active product - only show tilts that have this product
     int productTilts = countProductSweeps(st.precomputed, m_activeProduct);
+    if (productTilts <= 0) {
+        gpu::freeStation(stationIdx);
+        st.gpuInfo = {};
+        st.uploaded = false;
+        st.uploaded_product = -1;
+        st.uploaded_tilt = -1;
+        st.uploaded_sweep = -1;
+        m_gridDirty = true;
+        return;
+    }
     if (productTilts > m_maxTilts) m_maxTilts = productTilts;
 
     int sweepIdx = findProductSweep(st.precomputed, m_activeProduct, m_activeTilt);
     auto& pc = st.precomputed[sweepIdx];
     if (pc.num_radials == 0) return;
 
-    m_activeTiltAngle = pc.elevation_angle;
+    if (stationIdx == m_activeStationIdx || m_activeStationIdx < 0)
+        m_activeTiltAngle = pc.elevation_angle;
 
     // Build GpuStationInfo from precomputed data
     GpuStationInfo info = {};
@@ -329,6 +659,9 @@ void App::uploadStation(int stationIdx) {
     gpu::uploadStationData(stationIdx, info, pc.azimuths.data(), gatePtrs);
 
     st.gpuInfo = info;
+    st.uploaded_product = m_activeProduct;
+    st.uploaded_tilt = m_activeTilt;
+    st.uploaded_sweep = sweepIdx;
     if (!st.uploaded) {
         st.uploaded = true;
         int loaded = ++m_stationsLoaded;
@@ -342,8 +675,11 @@ void App::uploadStation(int stationIdx) {
 void App::buildSpatialGrid() {
     // GPU spatial grid construction
     std::vector<GpuStationInfo> infos(m_stations.size());
-    for (int i = 0; i < (int)m_stations.size(); i++)
-        infos[i] = m_stations[i].gpuInfo;
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        for (int i = 0; i < (int)m_stations.size(); i++)
+            infos[i] = m_stations[i].gpuInfo;
+    }
 
     gpu::buildSpatialGridGpu(infos.data(), (int)infos.size(), &m_spatialGrid);
     m_gridDirty = false;
@@ -416,36 +752,43 @@ void App::render() {
         float srvSpd = (m_srvMode && m_activeProduct == PROD_VEL) ? m_stormSpeed : 0.0f;
         float srvDir = m_stormDir;
 
-        if (m_historicMode) {
-            int cf = m_historic.currentFrame();
-            if (hasCachedFrame(cf)) {
-                // Use pre-baked cached frame (zero render cost)
-                cudaMemcpy(m_d_compositeOutput, m_cachedFrames[cf],
-                           (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t),
-                           cudaMemcpyDeviceToDevice);
-            } else {
-                gpu::forwardRenderStation(gpuVp, 0,
-                                          m_activeProduct, m_dbzMinThreshold,
-                                          m_d_compositeOutput, srvSpd, srvDir);
-                // Cache this rendered frame for instant replay
-                cacheAnimFrame(cf, m_d_compositeOutput, gpuVp.width, gpuVp.height);
-            }
-        } else if (m_mode3D && m_volumeBuilt) {
+        if (m_mode3D && m_volumeBuilt) {
             // 3D volumetric ray march
             gpu::renderVolume(m_camera, gpuVp.width, gpuVp.height,
                               m_activeProduct, m_dbzMinThreshold,
                               m_d_compositeOutput);
+        } else if (m_historicMode) {
+            int cf = m_historic.currentFrame();
+            if (hasCachedFrame(cf, gpuVp.width, gpuVp.height)) {
+                // Use pre-baked cached frame (zero render cost)
+                CUDA_CHECK(cudaMemcpy(m_d_compositeOutput, m_cachedFrames[cf],
+                                      (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t),
+                                      cudaMemcpyDeviceToDevice));
+            } else {
+                gpu::renderSingleStation(gpuVp, 0,
+                                         m_activeProduct, m_dbzMinThreshold,
+                                         m_d_compositeOutput, srvSpd, srvDir);
+                // Cache this rendered frame for instant replay
+                cacheAnimFrame(cf, m_d_compositeOutput, gpuVp.width, gpuVp.height);
+            }
         } else if (m_showAll) {
             // Mosaic: all stations
             if (m_gridDirty) buildSpatialGrid();
             std::vector<GpuStationInfo> gpuInfos(m_stations.size());
-            for (int i = 0; i < (int)m_stations.size(); i++)
-                gpuInfos[i] = m_stations[i].gpuInfo;
+            {
+                std::lock_guard<std::mutex> lock(m_stationMutex);
+                for (int i = 0; i < (int)m_stations.size(); i++)
+                    gpuInfos[i] = m_stations[i].gpuInfo;
+            }
             gpu::renderNative(gpuVp, gpuInfos.data(), (int)m_stations.size(),
                               m_spatialGrid, m_activeProduct, m_dbzMinThreshold,
                               m_d_compositeOutput);
         } else if (m_activeStationIdx >= 0) {
             // Single station: fast path
+            if (m_activeStationIdx < (int)m_stations.size() &&
+                !stationUploadMatchesSelection(m_stations[m_activeStationIdx])) {
+                uploadStation(m_activeStationIdx);
+            }
             gpu::forwardRenderStation(gpuVp, m_activeStationIdx,
                                       m_activeProduct, m_dbzMinThreshold,
                                       m_d_compositeOutput, srvSpd, srvDir);
@@ -464,10 +807,7 @@ void App::render() {
             if (m_xsHeight < 200) m_xsHeight = 200;
 
             // Ensure cross-section GPU buffer and GL texture exist
-            size_t xsSz = (size_t)m_xsWidth * m_xsHeight * sizeof(uint32_t);
-            if (!m_d_xsOutput) {
-                CUDA_CHECK(cudaMalloc(&m_d_xsOutput, xsSz));
-            }
+            ensureCrossSectionBuffer(m_xsWidth, m_xsHeight);
             m_xsTex.resize(m_xsWidth, m_xsHeight);
 
             gpu::renderCrossSection(
@@ -487,7 +827,7 @@ void App::render() {
 }
 
 void App::onScroll(double xoff, double yoff) {
-    m_cachedFrameCount = 0; // invalidate animation cache on zoom
+    invalidateFrameCache(true);
     if (m_mode3D) {
         m_camera.distance *= (yoff > 0) ? 0.9f : 1.1f;
         m_camera.distance = std::max(50.0f, std::min(1500.0f, m_camera.distance));
@@ -512,7 +852,7 @@ void App::onMouseDrag(double dx, double dy) {
     } else {
         m_viewport.center_lon -= dx / m_viewport.zoom;
         m_viewport.center_lat += dy / m_viewport.zoom;
-        m_cachedFrameCount = 0; // invalidate animation cache on pan
+        invalidateFrameCache(true);
     }
 }
 
@@ -538,6 +878,8 @@ void App::onMouseMove(double mx, double my) {
 
     if (bestIdx != m_activeStationIdx && bestIdx >= 0) {
         m_activeStationIdx = bestIdx;
+        if (!stationUploadMatchesSelection(m_stations[bestIdx]))
+            uploadStation(bestIdx);
     }
 }
 
@@ -558,6 +900,8 @@ void App::onResize(int w, int h) {
     if (m_d_compositeOutput) cudaFree(m_d_compositeOutput);
     CUDA_CHECK(cudaMalloc(&m_d_compositeOutput, (size_t)w * h * sizeof(uint32_t)));
 
+    ensureCrossSectionBuffer(w, std::max(200, h / 3));
+    invalidateFrameCache(true);
     m_outputTex.resize(w, h);
     m_needsComposite = true;
 }
@@ -568,15 +912,24 @@ void App::setProduct(int p) {
     m_activeProduct = p;
     m_activeTilt = 0; // reset tilt - different products have different valid tilts
     m_lastHistoricFrame = -1; // force re-upload in historic mode
-    m_cachedFrameCount = 0;   // invalidate animation cache
+    m_maxTilts = 1;
+    m_volumeBuilt = false;
+    m_volumeStation = -1;
+    invalidateFrameCache(true);
     m_needsRerender = true;
 
-    // Re-upload current station with new product's sweeps
     if (m_historicMode) {
-        // historic re-upload handled by update loop
-    } else if (m_activeStationIdx >= 0) {
-        uploadStation(m_activeStationIdx);
+        if (m_crossSection || m_mode3D)
+            rebuildVolumeForCurrentSelection();
+    } else {
+        for (int i = 0; i < (int)m_stations.size(); i++) {
+            if (m_stations[i].parsed && !m_stations[i].precomputed.empty())
+                uploadStation(i);
+        }
+        if (m_crossSection || m_mode3D)
+            rebuildVolumeForCurrentSelection();
     }
+    refreshActiveTiltMetadata();
 }
 
 void App::nextProduct() { setProduct((m_activeProduct + 1) % (int)Product::COUNT); }
@@ -587,6 +940,10 @@ void App::setTilt(int t) {
     if (t >= m_maxTilts) t = m_maxTilts - 1;
     if (t == m_activeTilt) return;
     m_activeTilt = t;
+    m_maxTilts = 1;
+    m_volumeBuilt = false;
+    m_volumeStation = -1;
+    invalidateFrameCache(true);
 
     if (m_historicMode) {
         m_lastHistoricFrame = -1; // force re-upload with new tilt
@@ -600,6 +957,9 @@ void App::setTilt(int t) {
             if (m_stations[i].uploaded) gpu::syncStation(i);
         }
     }
+    if (m_crossSection || m_mode3D)
+        rebuildVolumeForCurrentSelection();
+    refreshActiveTiltMetadata();
     m_needsRerender = true;
 }
 
@@ -662,21 +1022,14 @@ void App::toggleCrossSection() {
             m_xsEndLon = slon + 2.0f;
         }
 
-        // Allocate cross-section output buffer
-        if (!m_d_xsOutput) {
-            CUDA_CHECK(cudaMalloc(&m_d_xsOutput,
-                        (size_t)m_windowWidth * (m_windowHeight / 3) * sizeof(uint32_t)));
-        }
+        ensureCrossSectionBuffer(m_windowWidth, std::max(200, m_windowHeight / 3));
 
         if (m_historicMode) {
             // Force re-upload of current historic frame, which will build the volume
             m_lastHistoricFrame = -1;
         } else {
             // Build volume from live station data
-            if (!m_volumeBuilt || m_volumeStation != m_activeStationIdx)
-                toggle3D();
-            m_mode3D = false;
-            m_crossSection = true;
+            rebuildVolumeForCurrentSelection();
         }
     }
 }
@@ -684,72 +1037,21 @@ void App::toggleCrossSection() {
 void App::toggle3D() {
     m_mode3D = !m_mode3D;
     m_showAll = false;
-    if (m_mode3D) {
-        // Helper lambda to build volume from a vector of PrecomputedSweeps
-        auto buildVolumeFromSweeps = [&](const std::vector<PrecomputedSweep>& sweeps,
-                                          float slat, float slon, int stationSlot) {
-            int ns = (int)sweeps.size();
-            if (ns == 0) return;
-            std::vector<GpuStationInfo> sweepInfos(ns);
-            std::vector<const float*> azPtrs(ns);
-            std::vector<const uint16_t*> gatePtrs(ns);
+    if (m_mode3D)
+        rebuildVolumeForCurrentSelection();
+}
 
-            for (int s = 0; s < ns && s < 30; s++) {
-                auto& pc = sweeps[s];
-                int slot = 200 + s;
-                if (slot >= MAX_STATIONS) break;
+void App::toggleSRV() {
+    m_srvMode = !m_srvMode;
+    invalidateFrameCache(true);
+    m_needsRerender = true;
+}
 
-                GpuStationInfo info = {};
-                info.lat = slat;
-                info.lon = slon;
-                info.elevation_angle = pc.elevation_angle;
-                info.num_radials = pc.num_radials;
-                for (int p = 0; p < NUM_PRODUCTS; p++) {
-                    auto& pd = pc.products[p];
-                    if (!pd.has_data) continue;
-                    info.has_product[p] = true;
-                    info.num_gates[p] = pd.num_gates;
-                    info.first_gate_km[p] = pd.first_gate_km;
-                    info.gate_spacing_km[p] = pd.gate_spacing_km;
-                    info.scale[p] = pd.scale;
-                    info.offset[p] = pd.offset;
-                }
-                sweepInfos[s] = info;
-
-                gpu::allocateStation(slot, info);
-                const uint16_t* gp[NUM_PRODUCTS] = {};
-                for (int p = 0; p < NUM_PRODUCTS; p++)
-                    if (pc.products[p].has_data && !pc.products[p].gates.empty())
-                        gp[p] = pc.products[p].gates.data();
-                gpu::uploadStationData(slot, info, pc.azimuths.data(), gp);
-                gpu::syncStation(slot);
-
-                azPtrs[s] = gpu::getStationAzimuths(slot);
-                gatePtrs[s] = gpu::getStationGates(slot, m_activeProduct);
-            }
-
-            gpu::buildVolume(stationSlot, m_activeProduct,
-                              sweepInfos.data(), ns,
-                              azPtrs.data(), gatePtrs.data());
-            m_volumeBuilt = true;
-            m_volumeStation = stationSlot;
-        };
-
-        if (m_historicMode) {
-            // Build volume from historic frame's sweeps
-            const RadarFrame* fr = m_historic.frame(m_historic.currentFrame());
-            if (fr && fr->ready && !fr->sweeps.empty()) {
-                buildVolumeFromSweeps(fr->sweeps, fr->station_lat, fr->station_lon, 0);
-            }
-        } else if (m_activeStationIdx >= 0 && m_activeStationIdx < (int)m_stations.size()) {
-            auto& st = m_stations[m_activeStationIdx];
-            if (!st.precomputed.empty()) {
-                float slat = st.gpuInfo.lat != 0 ? st.gpuInfo.lat : st.lat;
-                float slon = st.gpuInfo.lon != 0 ? st.gpuInfo.lon : st.lon;
-                buildVolumeFromSweeps(st.precomputed, slat, slon, m_activeStationIdx);
-            }
-        }
-    }
+void App::setStormMotion(float speed, float dir) {
+    m_stormSpeed = speed;
+    m_stormDir = dir;
+    invalidateFrameCache(true);
+    m_needsRerender = true;
 }
 
 void App::rerenderAll() {
@@ -759,6 +1061,9 @@ void App::rerenderAll() {
 void App::loadHistoricEvent(int idx) {
     m_historicMode = true;
     m_lastHistoricFrame = -1;
+    m_volumeBuilt = false;
+    m_volumeStation = -1;
+    invalidateFrameCache(true);
     m_historic.loadEvent(idx);
     // Center viewport on the event
     if (idx >= 0 && idx < NUM_HISTORIC_EVENTS) {
@@ -774,11 +1079,17 @@ void App::uploadHistoricFrame(int frameIdx) {
 
     int slot = 0;
     // Filter by active product
+    int productTilts = countProductSweeps(fr->sweeps, m_activeProduct);
+    if (productTilts <= 0) {
+        gpu::freeStation(slot);
+        m_volumeBuilt = false;
+        m_volumeStation = -1;
+        return;
+    }
     int sweepIdx = findProductSweep(fr->sweeps, m_activeProduct, m_activeTilt);
     auto& pc = fr->sweeps[sweepIdx];
     if (pc.num_radials == 0) return;
 
-    int productTilts = countProductSweeps(fr->sweeps, m_activeProduct);
     if (productTilts > m_maxTilts) m_maxTilts = productTilts;
 
     GpuStationInfo info = {};
@@ -810,6 +1121,9 @@ void App::uploadHistoricFrame(int frameIdx) {
     if (m_stations.size() > 0) {
         m_stations[0].gpuInfo = info;
         m_stations[0].uploaded = true;
+        m_stations[0].uploaded_product = m_activeProduct;
+        m_stations[0].uploaded_tilt = m_activeTilt;
+        m_stations[0].uploaded_sweep = sweepIdx;
         m_stations[0].gpuInfo.lat = fr->station_lat;
         m_stations[0].gpuInfo.lon = fr->station_lon;
     }
@@ -818,52 +1132,8 @@ void App::uploadHistoricFrame(int frameIdx) {
     if ((int)fr->sweeps.size() > m_maxTilts)
         m_maxTilts = (int)fr->sweeps.size();
 
-    // If cross-section is active, rebuild 3D volume from this frame's ALL sweeps
-    if (m_crossSection) {
-        int ns = (int)fr->sweeps.size();
-        std::vector<GpuStationInfo> sweepInfos(ns);
-        std::vector<const float*> azPtrs(ns);
-        std::vector<const uint16_t*> gatePtrs2(ns);
-
-        for (int s = 0; s < ns && s < 30; s++) {
-            auto& spc = fr->sweeps[s];
-            int tempSlot = 200 + s;
-            if (tempSlot >= MAX_STATIONS) break;
-
-            GpuStationInfo si = {};
-            si.lat = fr->station_lat;
-            si.lon = fr->station_lon;
-            si.elevation_angle = spc.elevation_angle;
-            si.num_radials = spc.num_radials;
-            for (int p = 0; p < NUM_PRODUCTS; p++) {
-                auto& pd = spc.products[p];
-                if (!pd.has_data) continue;
-                si.has_product[p] = true;
-                si.num_gates[p] = pd.num_gates;
-                si.first_gate_km[p] = pd.first_gate_km;
-                si.gate_spacing_km[p] = pd.gate_spacing_km;
-                si.scale[p] = pd.scale;
-                si.offset[p] = pd.offset;
-            }
-            sweepInfos[s] = si;
-
-            gpu::allocateStation(tempSlot, si);
-            const uint16_t* gp[NUM_PRODUCTS] = {};
-            for (int p = 0; p < NUM_PRODUCTS; p++)
-                if (spc.products[p].has_data && !spc.products[p].gates.empty())
-                    gp[p] = spc.products[p].gates.data();
-            gpu::uploadStationData(tempSlot, si, spc.azimuths.data(), gp);
-            gpu::syncStation(tempSlot);
-
-            azPtrs[s] = gpu::getStationAzimuths(tempSlot);
-            gatePtrs2[s] = gpu::getStationGates(tempSlot, m_activeProduct);
-        }
-
-        gpu::buildVolume(0, m_activeProduct,
-                          sweepInfos.data(), ns,
-                          azPtrs.data(), gatePtrs2.data());
-        m_volumeBuilt = true;
-    }
+    if (m_crossSection || m_mode3D)
+        rebuildVolumeForCurrentSelection();
 }
 
 // (Demo pack methods removed)
@@ -893,10 +1163,8 @@ void App::computeDetection(int stationIdx) {
 
     float slat = st.gpuInfo.lat != 0 ? st.gpuInfo.lat : st.lat;
     float slon = st.gpuInfo.lon != 0 ? st.gpuInfo.lon : st.lon;
-    float cos_lat = cosf(slat * 3.14159265f / 180.0f);
+    float cos_lat = std::max(cosf(slat * kDegToRad), 0.1f);
 
-    // Find lowest elevation sweeps for each product
-    // Use sweep index 0 for REF (surveillance) and the matching Doppler sweep for CC/ZDR/VEL
     int refSweep = -1, ccSweep = -1, zdrSweep = -1, velSweep = -1;
     for (int s = 0; s < (int)st.precomputed.size(); s++) {
         auto& pc = st.precomputed[s];
@@ -918,44 +1186,54 @@ void App::computeDetection(int stationIdx) {
 
         int nr = ccPc.num_radials;
         int ng = ccPd.num_gates;
-        for (int ri = 0; ri < nr; ri++) {
-            float az_rad = ccPc.azimuths[ri] * 3.14159265f / 180.0f;
-            for (int gi = 0; gi < ng; gi += 2) { // skip every other gate for speed
-                // CC value
-                uint16_t raw_cc = ccPd.gates[(size_t)gi * nr + ri];
-                if (raw_cc <= 1) continue;
-                float cc = ((float)raw_cc - ccPd.offset) / ccPd.scale;
-                if (cc >= 0.80f || cc < 0.20f) continue;
+        if (nr > 0 && ng > 0) {
+            std::vector<uint8_t> candidate((size_t)nr * ng, 0);
+            std::vector<float> score((size_t)nr * ng, std::numeric_limits<float>::infinity());
 
-                // ZDR value (same sweep usually)
-                float zdr = 0;
-                if (gi < zdrPd.num_gates && ri < zdrPc.num_radials) {
-                    uint16_t raw_zdr = zdrPd.gates[(size_t)gi * zdrPc.num_radials + ri];
-                    if (raw_zdr > 1) zdr = ((float)raw_zdr - zdrPd.offset) / zdrPd.scale;
+            for (int ri = 0; ri < nr; ++ri) {
+                int zdr_ri = std::min((int)((int64_t)ri * zdrPc.num_radials / std::max(nr, 1)),
+                                      std::max(zdrPc.num_radials - 1, 0));
+                int ref_ri = std::min((int)((int64_t)ri * refPc.num_radials / std::max(nr, 1)),
+                                      std::max(refPc.num_radials - 1, 0));
+                for (int gi = 0; gi < ng; gi += 2) {
+                    float range_km = ccPd.first_gate_km + gi * ccPd.gate_spacing_km;
+                    if (range_km < 15.0f || range_km > 120.0f) continue;
+
+                    float cc = decodeGateValue(ccPd, nr, gi, ri);
+                    if (cc == kInvalidSample || cc < 0.55f || cc > 0.82f) continue;
+
+                    int zdr_gi = gateIndexForRange(zdrPd, range_km);
+                    int ref_gi = gateIndexForRange(refPd, range_km);
+                    if (zdr_gi < 0 || ref_gi < 0) continue;
+
+                    float zdr = decodeGateValue(zdrPd, zdrPc.num_radials, zdr_gi, zdr_ri);
+                    float ref = decodeGateValue(refPd, refPc.num_radials, ref_gi, ref_ri);
+                    if (zdr == kInvalidSample || ref == kInvalidSample) continue;
+                    if (fabsf(zdr) > 1.25f || ref < 40.0f) continue;
+
+                    candidate[(size_t)gi * nr + ri] = 1;
+                    score[(size_t)gi * nr + ri] = cc;
                 }
-                if (fabsf(zdr) > 1.5f) continue;
-
-                // REF value (may be on different sweep with different gate count)
-                float range_km = ccPd.first_gate_km + gi * ccPd.gate_spacing_km;
-                int ref_gi = (int)((range_km - refPd.first_gate_km) / refPd.gate_spacing_km);
-                if (ref_gi < 0 || ref_gi >= refPd.num_gates) continue;
-                // Find nearest REF radial
-                int ref_ri = ri;
-                if (ref_ri >= refPc.num_radials) ref_ri = refPc.num_radials - 1;
-                uint16_t raw_ref = refPd.gates[(size_t)ref_ri * 1 + 0]; // need proper indexing
-                // Proper gate-major indexing
-                raw_ref = refPd.gates[(size_t)ref_gi * refPc.num_radials + ref_ri];
-                if (raw_ref <= 1) continue;
-                float ref = ((float)raw_ref - refPd.offset) / refPd.scale;
-                if (ref < 35.0f) continue;
-
-                // TDS confirmed!
-                float east_km = range_km * sinf(az_rad);
-                float north_km = range_km * cosf(az_rad);
-                float mlat = slat + north_km / 111.0f;
-                float mlon = slon + east_km / (111.0f * cos_lat);
-                det.tds.push_back({mlat, mlon, cc});
             }
+
+            for (int ri = 0; ri < nr; ++ri) {
+                float az_rad = ccPc.azimuths[ri] * kDegToRad;
+                for (int gi = 0; gi < ng; gi += 2) {
+                    if (!candidate[(size_t)gi * nr + ri]) continue;
+                    if (countCandidateSupport(candidate, nr, ng, ri, gi, 2, 2) < 6) continue;
+                    if (!isLocalExtremum(score, candidate, nr, ng, ri, gi, 2, 2, true)) continue;
+
+                    float range_km = ccPd.first_gate_km + gi * ccPd.gate_spacing_km;
+                    float east_km = range_km * sinf(az_rad);
+                    float north_km = range_km * cosf(az_rad);
+                    det.tds.push_back({
+                        slat + north_km / 111.0f,
+                        slon + east_km / (111.0f * cos_lat),
+                        score[(size_t)gi * nr + ri]
+                    });
+                }
+            }
+            clusterMarkers(det.tds, 8.0f, 12, true);
         }
     }
 
@@ -968,33 +1246,51 @@ void App::computeDetection(int stationIdx) {
 
         int nr = refPc.num_radials;
         int ng = refPd.num_gates;
-        for (int ri = 0; ri < nr; ri++) {
-            float az_rad = refPc.azimuths[ri] * 3.14159265f / 180.0f;
-            for (int gi = 0; gi < ng; gi += 3) { // skip for speed
-                uint16_t raw_ref = refPd.gates[(size_t)gi * nr + ri];
-                if (raw_ref <= 1) continue;
-                float ref = ((float)raw_ref - refPd.offset) / refPd.scale;
-                if (ref < 45.0f) continue; // need strong echo for hail
+        if (nr > 0 && ng > 0) {
+            std::vector<uint8_t> candidate((size_t)nr * ng, 0);
+            std::vector<float> score((size_t)nr * ng, -std::numeric_limits<float>::infinity());
 
-                float range_km = refPd.first_gate_km + gi * refPd.gate_spacing_km;
-                // Find matching ZDR
-                int zdr_gi = (int)((range_km - zdrPd.first_gate_km) / zdrPd.gate_spacing_km);
-                int zdr_ri = ri;
-                if (zdr_gi < 0 || zdr_gi >= zdrPd.num_gates) continue;
-                if (zdr_ri >= zdrPc.num_radials) zdr_ri = zdrPc.num_radials - 1;
-                uint16_t raw_zdr = zdrPd.gates[(size_t)zdr_gi * zdrPc.num_radials + zdr_ri];
-                if (raw_zdr <= 1) continue;
-                float zdr = ((float)raw_zdr - zdrPd.offset) / zdrPd.scale;
+            for (int ri = 0; ri < nr; ++ri) {
+                int zdr_ri = std::min((int)((int64_t)ri * zdrPc.num_radials / std::max(nr, 1)),
+                                      std::max(zdrPc.num_radials - 1, 0));
+                for (int gi = 0; gi < ng; gi += 2) {
+                    float range_km = refPd.first_gate_km + gi * refPd.gate_spacing_km;
+                    if (range_km < 15.0f || range_km > 180.0f) continue;
 
-                float hdr = ref - (19.0f * std::max(zdr, 0.0f) + 27.0f);
-                if (hdr <= 0.0f) continue;
+                    float ref = decodeGateValue(refPd, nr, gi, ri);
+                    if (ref == kInvalidSample || ref < 55.0f) continue;
 
-                float east_km = range_km * sinf(az_rad);
-                float north_km = range_km * cosf(az_rad);
-                float mlat = slat + north_km / 111.0f;
-                float mlon = slon + east_km / (111.0f * cos_lat);
-                det.hail.push_back({mlat, mlon, hdr});
+                    int zdr_gi = gateIndexForRange(zdrPd, range_km);
+                    if (zdr_gi < 0) continue;
+                    float zdr = decodeGateValue(zdrPd, zdrPc.num_radials, zdr_gi, zdr_ri);
+                    if (zdr == kInvalidSample) continue;
+
+                    float hdr = ref - (19.0f * std::max(zdr, 0.0f) + 27.0f);
+                    if (hdr < 10.0f) continue;
+
+                    candidate[(size_t)gi * nr + ri] = 1;
+                    score[(size_t)gi * nr + ri] = hdr;
+                }
             }
+
+            for (int ri = 0; ri < nr; ++ri) {
+                float az_rad = refPc.azimuths[ri] * kDegToRad;
+                for (int gi = 0; gi < ng; gi += 2) {
+                    if (!candidate[(size_t)gi * nr + ri]) continue;
+                    if (countCandidateSupport(candidate, nr, ng, ri, gi, 2, 2) < 5) continue;
+                    if (!isLocalExtremum(score, candidate, nr, ng, ri, gi, 2, 2, false)) continue;
+
+                    float range_km = refPd.first_gate_km + gi * refPd.gate_spacing_km;
+                    float east_km = range_km * sinf(az_rad);
+                    float north_km = range_km * cosf(az_rad);
+                    det.hail.push_back({
+                        slat + north_km / 111.0f,
+                        slon + east_km / (111.0f * cos_lat),
+                        score[(size_t)gi * nr + ri]
+                    });
+                }
+            }
+            clusterMarkers(det.hail, 10.0f, 16, false);
         }
     }
 
@@ -1006,41 +1302,91 @@ void App::computeDetection(int stationIdx) {
         int ng = velPd.num_gates;
 
         if (nr >= 10 && ng >= 10) {
-            for (int gi = 10; gi < ng - 10; gi += 8) { // sparser scan
+            std::vector<uint8_t> candidate((size_t)nr * ng, 0);
+            std::vector<float> score((size_t)nr * ng, -std::numeric_limits<float>::infinity());
+            std::vector<float> diameter((size_t)nr * ng, 0.0f);
+
+            auto passesMesoGate = [&](int gate_idx, int radial_idx,
+                                      float range_km, float* shear_out,
+                                      float* span_out) -> bool {
+                int span = 2;
+                int ri_lo = (radial_idx - span + nr) % nr;
+                int ri_hi = (radial_idx + span) % nr;
+
+                float v_lo = decodeGateValue(velPd, nr, gate_idx, ri_lo);
+                float v_hi = decodeGateValue(velPd, nr, gate_idx, ri_hi);
+                if (v_lo == kInvalidSample || v_hi == kInvalidSample) return false;
+                if (fabsf(v_lo) < 12.0f || fabsf(v_hi) < 12.0f) return false;
+                if (v_lo * v_hi >= 0.0f) return false;
+
+                float shear_ms = fabsf(v_hi - v_lo);
+                if (shear_ms < 40.0f) return false;
+
+                float az_span_deg = span * 2.0f * (360.0f / nr);
+                float az_span_km = range_km * az_span_deg * kDegToRad;
+                if (az_span_km < 1.0f || az_span_km > 10.0f) return false;
+
+                *shear_out = shear_ms;
+                *span_out = az_span_km;
+                return true;
+            };
+
+            for (int gi = 12; gi < ng - 12; gi += 4) {
                 float range_km = velPd.first_gate_km + gi * velPd.gate_spacing_km;
-                if (range_km < 10.0f || range_km > 150.0f) continue;
+                if (range_km < 20.0f || range_km > 120.0f) continue;
 
-                for (int ri = 0; ri < nr; ri += 2) { // skip every other radial
-                    int span = 3;
-                    int ri_lo = (ri - span + nr) % nr;
-                    int ri_hi = (ri + span) % nr;
+                for (int ri = 0; ri < nr; ri += 2) {
+                    if (refSweep >= 0) {
+                        auto& refPc = st.precomputed[refSweep];
+                        auto& refPd = refPc.products[PROD_REF];
+                        int ref_ri = std::min((int)((int64_t)ri * refPc.num_radials / std::max(nr, 1)),
+                                              std::max(refPc.num_radials - 1, 0));
+                        int ref_gi = gateIndexForRange(refPd, range_km);
+                        float ref = decodeGateValue(refPd, refPc.num_radials, ref_gi, ref_ri);
+                        if (ref == kInvalidSample || ref < 35.0f) continue;
+                    }
 
-                    uint16_t raw_lo = velPd.gates[(size_t)gi * nr + ri_lo];
-                    uint16_t raw_hi = velPd.gates[(size_t)gi * nr + ri_hi];
-                    if (raw_lo <= 1 || raw_hi <= 1) continue;
+                    float shear_ms = 0.0f;
+                    float az_span_km = 0.0f;
+                    if (!passesMesoGate(gi, ri, range_km, &shear_ms, &az_span_km)) continue;
 
-                    float v_lo = ((float)raw_lo - velPd.offset) / velPd.scale;
-                    float v_hi = ((float)raw_hi - velPd.offset) / velPd.scale;
+                    int gate_support = 0;
+                    for (int dgi = -2; dgi <= 2; ++dgi) {
+                        int ngi = gi + dgi;
+                        if (ngi < 0 || ngi >= ng) continue;
+                        float neighbor_shear = 0.0f;
+                        float neighbor_span = 0.0f;
+                        float neighbor_range = velPd.first_gate_km + ngi * velPd.gate_spacing_km;
+                        if (passesMesoGate(ngi, ri, neighbor_range, &neighbor_shear, &neighbor_span))
+                            ++gate_support;
+                    }
+                    if (gate_support < 3) continue;
 
-                    // Need opposite signs (convergent/divergent) for rotation
-                    if (v_lo * v_hi >= 0) continue; // same sign = not rotation
-
-                    float dv = fabsf(v_hi - v_lo);
-                    float az_span_deg = span * 2.0f * (360.0f / nr);
-                    float az_span_km = range_km * az_span_deg * 3.14159265f / 180.0f;
-                    if (az_span_km < 0.5f) continue;
-
-                    float shear_ms = dv;
-                    if (shear_ms < 30.0f) continue; // 30 m/s min for real meso
-
-                    float az_rad = velPc.azimuths[ri] * 3.14159265f / 180.0f;
-                    float east_km = range_km * sinf(az_rad);
-                    float north_km = range_km * cosf(az_rad);
-                    float mlat = slat + north_km / 111.0f;
-                    float mlon = slon + east_km / (111.0f * cos_lat);
-                    det.meso.push_back({mlat, mlon, shear_ms, az_span_km});
+                    candidate[(size_t)gi * nr + ri] = 1;
+                    score[(size_t)gi * nr + ri] = shear_ms;
+                    diameter[(size_t)gi * nr + ri] = az_span_km;
                 }
             }
+
+            for (int gi = 12; gi < ng - 12; gi += 4) {
+                for (int ri = 0; ri < nr; ri += 2) {
+                    if (!candidate[(size_t)gi * nr + ri]) continue;
+                    if (countCandidateSupport(candidate, nr, ng, ri, gi, 2, 1) < 3) continue;
+                    if (!isLocalExtremum(score, candidate, nr, ng, ri, gi, 2, 1, false)) continue;
+
+                    float range_km = velPd.first_gate_km + gi * velPd.gate_spacing_km;
+                    float az_rad = velPc.azimuths[ri] * kDegToRad;
+                    float east_km = range_km * sinf(az_rad);
+                    float north_km = range_km * cosf(az_rad);
+                    det.meso.push_back({
+                        slat + north_km / 111.0f,
+                        slon + east_km / (111.0f * cos_lat),
+                        score[(size_t)gi * nr + ri],
+                        diameter[(size_t)gi * nr + ri]
+                    });
+                }
+            }
+            clusterMesoMarkers(det.meso, 12.0f, 12);
         }
     }
 
@@ -1147,10 +1493,19 @@ void App::switchTiltCached(int stationIdx, int newTilt) {
 
 void App::cacheAnimFrame(int frameIdx, const uint32_t* d_src, int w, int h) {
     if (frameIdx >= MAX_CACHED_FRAMES) return;
+    if (w <= 0 || h <= 0) return;
+
+    if ((m_cachedFrameWidth != 0 || m_cachedFrameHeight != 0) &&
+        (m_cachedFrameWidth != w || m_cachedFrameHeight != h)) {
+        invalidateFrameCache(true);
+    }
+
+    m_cachedFrameWidth = w;
+    m_cachedFrameHeight = h;
     size_t sz = (size_t)w * h * sizeof(uint32_t);
     if (!m_cachedFrames[frameIdx]) {
-        cudaMalloc(&m_cachedFrames[frameIdx], sz);
+        CUDA_CHECK(cudaMalloc(&m_cachedFrames[frameIdx], sz));
     }
-    cudaMemcpy(m_cachedFrames[frameIdx], d_src, sz, cudaMemcpyDeviceToDevice);
+    CUDA_CHECK(cudaMemcpy(m_cachedFrames[frameIdx], d_src, sz, cudaMemcpyDeviceToDevice));
     if (frameIdx >= m_cachedFrameCount) m_cachedFrameCount = frameIdx + 1;
 }

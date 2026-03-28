@@ -39,7 +39,7 @@ public:
     // Number of pending downloads
     int pending() const { return m_pending.load(); }
 
-    // Shutdown
+    // Shutdown workers and cancel queued-but-not-started downloads.
     void shutdown();
 
 private:

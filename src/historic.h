@@ -7,6 +7,8 @@
 #include <mutex>
 #include <atomic>
 #include <functional>
+#include <memory>
+#include <thread>
 
 // A single radar frame (one volume scan at one time)
 struct RadarFrame {
@@ -71,26 +73,24 @@ inline constexpr int NUM_HISTORIC_EVENTS = sizeof(HISTORIC_EVENTS) / sizeof(HIST
 class HistoricLoader {
 public:
     using ProgressCallback = std::function<void(int downloaded, int total)>;
+    ~HistoricLoader();
 
     // Start downloading frames for an event (async)
     void loadEvent(int eventIdx, ProgressCallback cb = nullptr);
 
     // Cancel current download
-    void cancel() { m_cancel = true; }
+    void cancel();
 
     // State
-    bool loading() const { return m_loading; }
-    bool loaded() const { return m_loaded; }
-    int  totalFrames() const { return m_totalFrames; }
+    bool loading() const { return m_loading.load(); }
+    bool loaded() const { return m_loaded.load(); }
+    int  totalFrames() const { return m_totalFrames.load(); }
     int  downloadedFrames() const { return m_downloadedFrames.load(); }
-    const HistoricEvent* currentEvent() const { return m_event; }
+    const HistoricEvent* currentEvent() const { return m_event.load(); }
 
     // Frame access
-    int numFrames() const { return (int)m_frames.size(); }
-    const RadarFrame* frame(int idx) const {
-        if (idx < 0 || idx >= (int)m_frames.size()) return nullptr;
-        return &m_frames[idx];
-    }
+    int numFrames() const;
+    const RadarFrame* frame(int idx) const;
 
     // Animation state
     int   currentFrame() const { return m_currentFrame; }
@@ -104,13 +104,19 @@ public:
     void  update(float dt);
 
 private:
-    std::vector<RadarFrame> m_frames;
-    const HistoricEvent* m_event = nullptr;
+    void joinWorker();
+
+    std::vector<std::shared_ptr<const RadarFrame>> m_frames;
+    mutable std::mutex m_framesMutex;
+    std::mutex m_workerMutex;
+    std::thread m_worker;
+    std::shared_ptr<class Downloader> m_downloader;
+    std::atomic<const HistoricEvent*> m_event{nullptr};
     std::atomic<int> m_downloadedFrames{0};
-    int  m_totalFrames = 0;
-    bool m_loading = false;
-    bool m_loaded = false;
-    bool m_cancel = false;
+    std::atomic<int> m_totalFrames{0};
+    std::atomic<bool> m_loading{false};
+    std::atomic<bool> m_loaded{false};
+    std::atomic<bool> m_cancel{false};
 
     int   m_currentFrame = 0;
     bool  m_playing = false;
