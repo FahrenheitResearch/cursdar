@@ -261,7 +261,7 @@ __device__ float sampleStation(
     float max_range = fgkm + ng * gskm;
     if (range_km < fgkm || range_km > max_range) return -999.0f;
 
-    // Nearest radial + nearest gate (crisp per-gate rendering)
+    // Nearest radial with fallback (fills beam width)
     int idx_hi = bsearchAz(ptrs.azimuths, nr, az);
     int idx_lo = (idx_hi == 0) ? nr - 1 : idx_hi - 1;
     if (idx_hi >= nr) idx_hi = 0;
@@ -270,13 +270,15 @@ __device__ float sampleStation(
     float d_hi = fabsf(az - ptrs.azimuths[idx_hi]);
     if (d_lo > 180.0f) d_lo = 360.0f - d_lo;
     if (d_hi > 180.0f) d_hi = 360.0f - d_hi;
-    int ri = (d_lo <= d_hi) ? idx_lo : idx_hi;
 
     int gi = (int)((range_km - fgkm) / gskm);
     if (gi < 0 || gi >= ng) return -999.0f;
 
     const uint16_t* gd = ptrs.gates[product];
-    uint16_t raw = gd[gi * nr + ri];
+    int ri_first = (d_lo <= d_hi) ? idx_lo : idx_hi;
+    int ri_second = (d_lo <= d_hi) ? idx_hi : idx_lo;
+    uint16_t raw = gd[gi * nr + ri_first];
+    if (raw <= 1) raw = gd[gi * nr + ri_second];
     if (raw <= 1) return -999.0f;
 
     float sc = info.scale[product], off = info.offset[product];
@@ -596,24 +598,26 @@ __global__ void singleStationKernel(
         s_az[i] = azimuths[i];
     __syncthreads();
 
-    // Nearest radial (no interpolation - crisp per-gate rendering like RadarScope)
+    // Nearest radial with fallback to adjacent (fills beam width, no gaps)
     int idx_hi = bsearchAz(s_az, nr, az);
     int idx_lo = (idx_hi == 0) ? nr - 1 : idx_hi - 1;
     if (idx_hi >= nr) idx_hi = 0;
 
-    // Pick the closer radial
     float d_lo = fabsf(az - s_az[idx_lo]);
     float d_hi = fabsf(az - s_az[idx_hi]);
     if (d_lo > 180.0f) d_lo = 360.0f - d_lo;
     if (d_hi > 180.0f) d_hi = 360.0f - d_hi;
-    int ri = (d_lo <= d_hi) ? idx_lo : idx_hi;
 
-    // Nearest gate (integer index, no fractional interpolation)
+    // Nearest gate
     int gi = (int)((range_km - fgkm) / gskm);
     if (gi < 0 || gi >= ng) { output[py * vp.width + px] = bg; return; }
 
-    // Single gate read (gate-major layout)
-    uint16_t raw = gates[gi * nr + ri];
+    // Try nearest radial first, then fallback to the other adjacent one
+    int ri_first = (d_lo <= d_hi) ? idx_lo : idx_hi;
+    int ri_second = (d_lo <= d_hi) ? idx_hi : idx_lo;
+
+    uint16_t raw = gates[gi * nr + ri_first];
+    if (raw <= 1) raw = gates[gi * nr + ri_second]; // fallback
     if (raw <= 1) { output[py * vp.width + px] = bg; return; }
 
     float sc = info.scale[product], off = info.offset[product];

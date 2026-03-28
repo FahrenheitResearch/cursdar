@@ -77,6 +77,7 @@ endif()
 add_executable(cursdar
     src/main.cpp
     src/app.cpp
+    src/historic.cpp
     src/nexrad/level2_parser.cpp
     src/net/downloader.cpp
     src/render/gl_interop.cpp

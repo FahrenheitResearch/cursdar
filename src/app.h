@@ -6,6 +6,7 @@
 #include "render/projection.h"
 #include "cuda/volume3d.cuh"
 #include "net/downloader.h"
+#include "historic.h"
 #include <vector>
 #include <string>
 #include <mutex>
@@ -13,22 +14,7 @@
 #include <memory>
 #include <chrono>
 
-// Pre-computed GPU-ready sweep data (computed once at parse time)
-struct PrecomputedSweep {
-    float elevation_angle;
-    int   num_radials;
-    std::vector<float> azimuths;
-    // Per product: transposed gate data (gate-major), gate params
-    struct ProductData {
-        bool has_data = false;
-        int  num_gates = 0;
-        float first_gate_km = 0;
-        float gate_spacing_km = 0;
-        float scale = 0, offset = 0;
-        std::vector<uint16_t> gates; // gate-major: [gate][radial]
-    };
-    ProductData products[NUM_PRODUCTS];
-};
+#include "nexrad/sweep_data.h"
 
 // Per-station state
 struct StationState {
@@ -188,5 +174,15 @@ private:
 
     // Auto-refresh timer
     std::chrono::steady_clock::time_point m_lastRefresh;
-    float m_refreshIntervalSec = 300.0f; // 5 minutes
+    float m_refreshIntervalSec = 300.0f;
+
+public:
+    // Historic event viewer
+    HistoricLoader m_historic;
+    bool m_historicMode = false;
+    int  m_lastHistoricFrame = -1;
+    void loadHistoricEvent(int idx);
+    void uploadHistoricFrame(int frameIdx);
+
+    // (Demo packs removed)
 };

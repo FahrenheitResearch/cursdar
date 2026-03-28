@@ -288,15 +288,18 @@ __global__ void rayMarchKernel(
     output[py * width + px] = mkRGBA((uint8_t)(fr*255), (uint8_t)(fg*255), (uint8_t)(fb*255));
 }
 
-// ── Cross-section kernel ─────────────────────────────────────
-// Direct sampling from sweep data (no volume texture). Each pixel maps to
-// a specific (distance_along_line, altitude) → find the sweep closest to
-// that elevation angle and sample the nearest gate. Crisp, no interpolation.
+// ── Cross-section kernel (flat 2D grid, GR2Analyst style) ───
+// NOT a 3D volume slice. For each (distance, height) pixel:
+// compute range from station, find the tilt whose beam passes at
+// that height at that range, sample the gate. Flat rectangular grid.
+
+constexpr float XS_MAX_HEIGHT_KM = 15.0f;
 
 __global__ void crossSectionKernel(
     float start_x_km, float start_y_km,
     float dir_x, float dir_y,
     float total_dist_km,
+    float station_x_km, float station_y_km, // station offset from itself = 0,0
     int width, int height,
     int product, float dbz_min,
     uint32_t* __restrict__ output)
@@ -305,80 +308,93 @@ __global__ void crossSectionKernel(
     int py = blockIdx.y * blockDim.y + threadIdx.y;
     if (px >= width || py >= height) return;
 
-    float dist_km = ((float)px / width) * total_dist_km;
-    float alt_km = (1.0f - (float)py / height) * VOL_HEIGHT_KM;
+    // Flat grid: X = distance along line, Y = altitude
+    float dist_along = ((float)px / width) * total_dist_km;
+    float alt_km = (1.0f - (float)py / height) * XS_MAX_HEIGHT_KM;
 
-    float x_km = start_x_km + dir_x * dist_km;
-    float y_km = start_y_km + dir_y * dist_km;
+    // Position along the line in km relative to station
+    float x_km = start_x_km + dir_x * dist_along;
+    float y_km = start_y_km + dir_y * dist_along;
 
-    // Background with subtle grid
-    float bgf = 0.04f + (1.0f - (float)py / height) * 0.02f;
-    uint32_t bg = mkRGBA((uint8_t)(bgf*200), (uint8_t)(bgf*210), (uint8_t)(bgf*255));
-    float hgrid = fmodf(dist_km, 50.0f);
-    float vgrid = fmodf(alt_km, 2.0f);
-    if (fminf(hgrid, 50.0f-hgrid) < 0.6f || fminf(vgrid, 2.0f-vgrid) < 0.04f)
-        bg = mkRGBA((uint8_t)(bgf*200+12), (uint8_t)(bgf*210+16), (uint8_t)(bgf*255+20));
+    // Ground range from station to this point
+    float ground_range = sqrtf(x_km * x_km + y_km * y_km);
+    if (ground_range < 1.0f) ground_range = 1.0f;
 
-    // Horizontal range and elevation angle from station to this point
-    float horiz_range = sqrtf(x_km*x_km + y_km*y_km);
+    // Azimuth from station
     float azimuth = atan2f(x_km, y_km) * (180.0f / (float)M_PI);
     if (azimuth < 0) azimuth += 360.0f;
-    float elev_angle = atan2f(alt_km, horiz_range) * (180.0f / (float)M_PI);
-    float slant_range = sqrtf(horiz_range*horiz_range + alt_km*alt_km);
 
-    // Find nearest sweep by elevation
-    int best_sw = -1;
-    float best_diff = 999.0f;
+    // Background with grid
+    uint32_t bg = mkRGBA(18, 18, 25);
+    float hgrid = fmodf(dist_along, 25.0f);
+    float vgrid = fmodf(alt_km, 1.524f); // 5kft in km
+    if (fminf(hgrid, 25.0f - hgrid) < 0.3f)
+        bg = mkRGBA(25, 25, 35);
+    if (fminf(vgrid, 1.524f - vgrid) < 0.02f)
+        bg = mkRGBA(25, 25, 35);
+
+    // For this (ground_range, alt_km), which tilt's beam is closest?
+    // Beam height at range r for elevation e: h = r * sin(e) + r^2/(2*Re)
+    // Re = 8494 km (4/3 earth radius for standard refraction)
+    const float Re = 8494.0f;
+
+    float best_val = -999.0f;
+    float best_dist = 999.0f;
+
     for (int s = 0; s < c_numSweeps; s++) {
-        float d = fabsf(c_sweeps[s].elevation_deg - elev_angle);
-        if (d < best_diff) { best_diff = d; best_sw = s; }
+        const SweepDesc& sw = c_sweeps[s];
+        if (!sw.gates || sw.num_radials <= 0 || sw.gate_spacing_km <= 0) continue;
+
+        float elev_rad = sw.elevation_deg * (float)M_PI / 180.0f;
+
+        // Beam height at this ground range for this tilt
+        float slant_range = ground_range / cosf(elev_rad);
+        float beam_h = slant_range * sinf(elev_rad) + (ground_range * ground_range) / (2.0f * Re);
+
+        // How far is this beam from the target altitude?
+        float h_diff = fabsf(beam_h - alt_km);
+
+        // Beam width in km at this range (~1 degree)
+        float beam_width_km = slant_range * 0.0175f; // ~1 degree in radians
+        if (beam_width_km < 0.3f) beam_width_km = 0.3f;
+
+        // Only use if within half beam width
+        if (h_diff > beam_width_km * 0.6f) continue;
+        if (h_diff >= best_dist) continue;
+
+        // Check range bounds
+        float max_r = sw.first_gate_km + sw.num_gates * sw.gate_spacing_km;
+        if (slant_range < sw.first_gate_km || slant_range > max_r) continue;
+
+        // Sample: nearest radial, nearest gate
+        int ih = bsAz(sw.azimuths, sw.num_radials, azimuth);
+        int il = (ih == 0) ? sw.num_radials - 1 : ih - 1;
+        if (ih >= sw.num_radials) ih = 0;
+        float dl = fabsf(azimuth - sw.azimuths[il]);
+        float dh = fabsf(azimuth - sw.azimuths[ih]);
+        if (dl > 180) dl = 360 - dl;
+        if (dh > 180) dh = 360 - dh;
+        int ri = (dl <= dh) ? il : ih;
+
+        int gi = (int)((slant_range - sw.first_gate_km) / sw.gate_spacing_km);
+        if (gi < 0 || gi >= sw.num_gates) continue;
+
+        uint16_t raw = sw.gates[gi * sw.num_radials + ri];
+        if (raw <= 1) continue;
+
+        float val = ((float)raw - sw.offset) / sw.scale;
+        if (val > best_val || h_diff < best_dist) {
+            best_val = val;
+            best_dist = h_diff;
+        }
     }
 
-    if (best_sw < 0 || best_diff > 3.0f) {
-        output[py * width + px] = bg;
-        return;
-    }
+    if (best_val <= dbz_min) { output[py * width + px] = bg; return; }
 
-    const SweepDesc& sw = c_sweeps[best_sw];
-    if (!sw.gates || sw.num_radials <= 0 || sw.gate_spacing_km <= 0) {
-        output[py * width + px] = bg;
-        return;
-    }
-
-    float max_r = sw.first_gate_km + sw.num_gates * sw.gate_spacing_km;
-    if (slant_range < sw.first_gate_km || slant_range > max_r) {
-        output[py * width + px] = bg;
-        return;
-    }
-
-    // Nearest radial (no interpolation)
-    int ih = bsAz(sw.azimuths, sw.num_radials, azimuth);
-    int il = (ih == 0) ? sw.num_radials - 1 : ih - 1;
-    if (ih >= sw.num_radials) ih = 0;
-    float dl = fabsf(azimuth - sw.azimuths[il]);
-    float dh = fabsf(azimuth - sw.azimuths[ih]);
-    if (dl > 180) dl = 360-dl;
-    if (dh > 180) dh = 360-dh;
-    int ri = (dl <= dh) ? il : ih;
-
-    // Nearest gate
-    int gi = (int)((slant_range - sw.first_gate_km) / sw.gate_spacing_km);
-    if (gi < 0 || gi >= sw.num_gates) {
-        output[py * width + px] = bg;
-        return;
-    }
-
-    uint16_t raw = sw.gates[gi * sw.num_radials + ri];
-    if (raw <= 1) { output[py * width + px] = bg; return; }
-
-    float val = ((float)raw - sw.offset) / sw.scale;
-    if (val <= dbz_min) { output[py * width + px] = bg; return; }
-
-    // Color
-    float norm = fminf(fmaxf((val + 30.0f) / 105.0f, 0.0f), 1.0f);
+    float norm = fminf(fmaxf((best_val + 30.0f) / 105.0f, 0.0f), 1.0f);
     int cidx = min(max((int)(norm * 254.0f) + 1, 1), 255);
     uint32_t color = c_colorTable[product][cidx];
-    output[py * width + px] = color | 0xFF000000u; // force full alpha
+    output[py * width + px] = color | 0xFF000000u;
 }
 
 // ── API ─────────────────────────────────────────────────────
@@ -521,6 +537,7 @@ void renderCrossSection(
 
     crossSectionKernel<<<grid, block>>>(
         sx_km, sy_km, nx, ny, total,
+        0.0f, 0.0f, // station is at origin in its own coordinate system
         width, height, product, dbz_min, d_output);
     CUDA_CHECK(cudaGetLastError());
 }

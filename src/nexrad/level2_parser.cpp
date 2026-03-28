@@ -340,11 +340,64 @@ ParsedRadarData Level2Parser::parse(const std::vector<uint8_t>& fileData) {
     return parse(fileData, nullptr);
 }
 
+// Decompress gzip data using Windows Compression API (Win8+)
+#ifdef _WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0602
+#endif
+#include <windows.h>
+#include <compressapi.h>
+#pragma comment(lib, "cabinet.lib")
+#ifndef COMPRESS_ALGORITHM_GZIP
+#define COMPRESS_ALGORITHM_GZIP 0x0A
+#endif
+#endif
+
+static std::vector<uint8_t> decompressGzip(const std::vector<uint8_t>& data) {
+#ifdef _WIN32
+    DECOMPRESSOR_HANDLE h = NULL;
+    if (!CreateDecompressor(COMPRESS_ALGORITHM_GZIP, NULL, &h)) return {};
+
+    // First pass: get decompressed size
+    SIZE_T outSize = 0;
+    Decompress(h, data.data(), data.size(), NULL, 0, &outSize);
+    if (outSize == 0 || outSize > 200 * 1024 * 1024) { // sanity: max 200MB
+        CloseDecompressor(h);
+        return {};
+    }
+
+    std::vector<uint8_t> output(outSize);
+    SIZE_T actualSize = 0;
+    BOOL ok = Decompress(h, data.data(), data.size(),
+                          output.data(), outSize, &actualSize);
+    CloseDecompressor(h);
+
+    if (!ok) return {};
+    output.resize(actualSize);
+    return output;
+#else
+    // TODO: use zlib on Linux
+    return {};
+#endif
+}
+
 ParsedRadarData Level2Parser::parse(const std::vector<uint8_t>& fileData,
                                      ProgressCallback cb) {
     ParsedRadarData result;
 
     if (fileData.size() < 24) return result;
+
+    // Check for gzip magic bytes (0x1F 0x8B) - historic S3 files are .gz
+    if (fileData[0] == 0x1F && fileData[1] == 0x8B) {
+        printf("  (gzip detected, decompressing...)\n");
+        auto decompressed = decompressGzip(fileData);
+        if (decompressed.empty()) {
+            printf("  gzip decompression failed\n");
+            return result;
+        }
+        printf("  gzip: %zu -> %zu bytes\n", fileData.size(), decompressed.size());
+        return parse(decompressed, cb); // recurse with decompressed data
+    }
 
     // Read volume header
     const VolumeHeader* vh = reinterpret_cast<const VolumeHeader*>(fileData.data());

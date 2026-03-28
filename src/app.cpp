@@ -228,19 +228,66 @@ void App::processDownload(int stationIdx, std::vector<uint8_t> data) {
     }
 }
 
+// Build a list of "best" sweep indices for a product:
+// At each unique elevation, keep only the sweep with the most gates.
+// This deduplicates split-cut sweeps and removes junk tilts.
+static std::vector<int> getBestSweeps(const std::vector<PrecomputedSweep>& sweeps, int product) {
+    // Collect all sweeps that have this product, grouped by elevation
+    struct ElevEntry { int sweepIdx; float elev; int gates; };
+    std::vector<ElevEntry> candidates;
+    for (int i = 0; i < (int)sweeps.size(); i++) {
+        if (sweeps[i].products[product].has_data && sweeps[i].num_radials > 0) {
+            candidates.push_back({i, sweeps[i].elevation_angle,
+                                   sweeps[i].products[product].num_gates});
+        }
+    }
+
+    // For each unique elevation (within 0.3°), keep the one with most gates
+    std::vector<int> best;
+    for (auto& c : candidates) {
+        bool dominated = false;
+        for (auto& b : best) {
+            float de = fabsf(sweeps[b].elevation_angle - c.elev);
+            if (de < 0.3f) {
+                // Same elevation - keep the one with more gates
+                if (c.gates > sweeps[b].products[product].num_gates) {
+                    b = c.sweepIdx; // replace with better one
+                }
+                dominated = true;
+                break;
+            }
+        }
+        if (!dominated) {
+            best.push_back(c.sweepIdx);
+        }
+    }
+    return best;
+}
+
+static int findProductSweep(const std::vector<PrecomputedSweep>& sweeps, int product, int tiltIdx) {
+    auto best = getBestSweeps(sweeps, product);
+    if (best.empty()) return 0;
+    if (tiltIdx < 0) tiltIdx = 0;
+    if (tiltIdx >= (int)best.size()) tiltIdx = (int)best.size() - 1;
+    return best[tiltIdx];
+}
+
+static int countProductSweeps(const std::vector<PrecomputedSweep>& sweeps, int product) {
+    return (int)getBestSweeps(sweeps, product).size();
+}
+
 void App::uploadStation(int stationIdx) {
     auto& st = m_stations[stationIdx];
     if (st.precomputed.empty()) return;
 
-    // Find best sweep for current tilt - match by index, clamped
-    int tiltIdx = m_activeTilt;
-    if (tiltIdx >= (int)st.precomputed.size()) tiltIdx = 0;
-    auto& pc = st.precomputed[tiltIdx];
+    // Filter sweeps by active product - only show tilts that have this product
+    int productTilts = countProductSweeps(st.precomputed, m_activeProduct);
+    if (productTilts > m_maxTilts) m_maxTilts = productTilts;
+
+    int sweepIdx = findProductSweep(st.precomputed, m_activeProduct, m_activeTilt);
+    auto& pc = st.precomputed[sweepIdx];
     if (pc.num_radials == 0) return;
 
-    // Track max tilts
-    if ((int)st.precomputed.size() > m_maxTilts)
-        m_maxTilts = (int)st.precomputed.size();
     m_activeTiltAngle = pc.elevation_angle;
 
     // Build GpuStationInfo from precomputed data
@@ -296,6 +343,37 @@ void App::buildSpatialGrid() {
 }
 
 void App::update(float dt) {
+    // Historic mode: lock to event station, upload only on frame change
+    if (m_historicMode) {
+        if (m_historic.downloadedFrames() > 0) {
+            m_historic.update(dt);
+            int curFrame = m_historic.currentFrame();
+
+            // If current frame isn't ready, find nearest ready one
+            const RadarFrame* fr = m_historic.frame(curFrame);
+            if (!fr || !fr->ready) {
+                for (int i = 0; i < m_historic.numFrames(); i++) {
+                    if (m_historic.frame(i) && m_historic.frame(i)->ready) {
+                        curFrame = i;
+                        m_historic.setFrame(i);
+                        break;
+                    }
+                }
+            }
+
+            // Only upload when frame actually changes
+            if (curFrame != m_lastHistoricFrame) {
+                fr = m_historic.frame(curFrame);
+                if (fr && fr->ready) {
+                    uploadHistoricFrame(curFrame);
+                    m_lastHistoricFrame = curFrame;
+                    printf("Historic frame %d: %s\n", curFrame, fr->timestamp.c_str());
+                }
+            }
+        }
+        return;
+    }
+
     // Process GPU upload queue
     {
         std::lock_guard<std::mutex> lock(m_uploadMutex);
@@ -328,7 +406,11 @@ void App::render() {
         gpuVp.width = m_viewport.width;
         gpuVp.height = m_viewport.height;
 
-        if (m_mode3D && m_volumeBuilt) {
+        if (m_historicMode) {
+            gpu::renderSingleStation(gpuVp, 0,
+                                      m_activeProduct, m_dbzMinThreshold,
+                                      m_d_compositeOutput);
+        } else if (m_mode3D && m_volumeBuilt) {
             // 3D volumetric ray march
             gpu::renderVolume(m_camera, gpuVp.width, gpuVp.height,
                               m_activeProduct, m_dbzMinThreshold,
@@ -352,8 +434,11 @@ void App::render() {
                         (size_t)m_viewport.width * m_viewport.height * sizeof(uint32_t)));
         }
         // Cross-section: render to separate texture for floating panel
-        if (m_crossSection && m_volumeBuilt && m_activeStationIdx >= 0) {
-            auto& st = m_stations[m_activeStationIdx];
+        // In historic mode, use slot 0's data; otherwise use active station
+        int xsStationSlot = m_historicMode ? 0 : m_activeStationIdx;
+        if (m_crossSection && m_volumeBuilt && xsStationSlot >= 0 &&
+            xsStationSlot < (int)m_stations.size()) {
+            auto& st = m_stations[xsStationSlot];
             m_xsWidth = gpuVp.width;
             m_xsHeight = gpuVp.height / 3;
             if (m_xsHeight < 200) m_xsHeight = 200;
@@ -459,7 +544,16 @@ void App::setProduct(int p) {
     if (p < 0 || p >= (int)Product::COUNT) return;
     if (p == m_activeProduct) return;
     m_activeProduct = p;
+    m_activeTilt = 0; // reset tilt - different products have different valid tilts
+    m_lastHistoricFrame = -1; // force re-upload in historic mode
     m_needsRerender = true;
+
+    // Re-upload current station with new product's sweeps
+    if (m_historicMode) {
+        // historic re-upload handled by update loop
+    } else if (m_activeStationIdx >= 0) {
+        uploadStation(m_activeStationIdx);
+    }
 }
 
 void App::nextProduct() { setProduct((m_activeProduct + 1) % (int)Product::COUNT); }
@@ -471,20 +565,19 @@ void App::setTilt(int t) {
     if (t == m_activeTilt) return;
     m_activeTilt = t;
 
-    // Re-upload all stations with new tilt (uses precomputed data - fast)
-    for (int i = 0; i < (int)m_stations.size(); i++) {
-        if (m_stations[i].parsed && !m_stations[i].precomputed.empty()) {
-            uploadStation(i);
+    if (m_historicMode) {
+        m_lastHistoricFrame = -1; // force re-upload with new tilt
+    } else {
+        // Re-upload all stations with new tilt
+        for (int i = 0; i < (int)m_stations.size(); i++) {
+            if (m_stations[i].parsed && !m_stations[i].precomputed.empty())
+                uploadStation(i);
+        }
+        for (int i = 0; i < (int)m_stations.size(); i++) {
+            if (m_stations[i].uploaded) gpu::syncStation(i);
         }
     }
-    // Sync all uploads
-    for (int i = 0; i < (int)m_stations.size(); i++) {
-        if (m_stations[i].uploaded) gpu::syncStation(i);
-    }
     m_needsRerender = true;
-
-    if (m_activeTilt < (int)m_stations[0].precomputed.size())
-        m_activeTiltAngle = m_stations[0].precomputed[m_activeTilt].elevation_angle;
 }
 
 void App::nextTilt() { setTilt(m_activeTilt + 1); }
@@ -529,23 +622,38 @@ void App::toggleCrossSection() {
     m_crossSection = !m_crossSection;
     if (m_crossSection) {
         m_mode3D = false;
-        // Default cross-section through the active station
-        if (m_activeStationIdx >= 0) {
-            auto& st = m_stations[m_activeStationIdx];
-            m_xsStartLat = st.gpuInfo.lat - 2.0f;
-            m_xsStartLon = st.gpuInfo.lon - 2.0f;
-            m_xsEndLat = st.gpuInfo.lat + 2.0f;
-            m_xsEndLon = st.gpuInfo.lon + 2.0f;
+
+        // Position cross-section through the active station
+        float slat = 0, slon = 0;
+        if (m_historicMode) {
+            auto* fr = m_historic.frame(m_historic.currentFrame());
+            if (fr && fr->ready) { slat = fr->station_lat; slon = fr->station_lon; }
+        } else if (m_activeStationIdx >= 0) {
+            slat = m_stations[m_activeStationIdx].gpuInfo.lat;
+            slon = m_stations[m_activeStationIdx].gpuInfo.lon;
         }
-        // Build volume if needed
-        if (!m_volumeBuilt || m_volumeStation != m_activeStationIdx)
-            toggle3D(); // reuse volume build, then switch back
-        m_mode3D = false;
-        m_crossSection = true;
+        if (slat != 0) {
+            m_xsStartLat = slat - 1.5f;
+            m_xsStartLon = slon - 2.0f;
+            m_xsEndLat = slat + 1.5f;
+            m_xsEndLon = slon + 2.0f;
+        }
+
         // Allocate cross-section output buffer
         if (!m_d_xsOutput) {
             CUDA_CHECK(cudaMalloc(&m_d_xsOutput,
                         (size_t)m_windowWidth * (m_windowHeight / 3) * sizeof(uint32_t)));
+        }
+
+        if (m_historicMode) {
+            // Force re-upload of current historic frame, which will build the volume
+            m_lastHistoricFrame = -1;
+        } else {
+            // Build volume from live station data
+            if (!m_volumeBuilt || m_volumeStation != m_activeStationIdx)
+                toggle3D();
+            m_mode3D = false;
+            m_crossSection = true;
         }
     }
 }
@@ -613,6 +721,118 @@ void App::toggle3D() {
 void App::rerenderAll() {
     m_needsRerender = true;
 }
+
+void App::loadHistoricEvent(int idx) {
+    m_historicMode = true;
+    m_lastHistoricFrame = -1;
+    m_historic.loadEvent(idx);
+    // Center viewport on the event
+    if (idx >= 0 && idx < NUM_HISTORIC_EVENTS) {
+        m_viewport.center_lat = HISTORIC_EVENTS[idx].center_lat;
+        m_viewport.center_lon = HISTORIC_EVENTS[idx].center_lon;
+        m_viewport.zoom = HISTORIC_EVENTS[idx].zoom;
+    }
+}
+
+void App::uploadHistoricFrame(int frameIdx) {
+    const RadarFrame* fr = m_historic.frame(frameIdx);
+    if (!fr || !fr->ready || fr->sweeps.empty()) return;
+
+    int slot = 0;
+    // Filter by active product
+    int sweepIdx = findProductSweep(fr->sweeps, m_activeProduct, m_activeTilt);
+    auto& pc = fr->sweeps[sweepIdx];
+    if (pc.num_radials == 0) return;
+
+    int productTilts = countProductSweeps(fr->sweeps, m_activeProduct);
+    if (productTilts > m_maxTilts) m_maxTilts = productTilts;
+
+    GpuStationInfo info = {};
+    info.lat = fr->station_lat;
+    info.lon = fr->station_lon;
+    info.elevation_angle = pc.elevation_angle;
+    info.num_radials = pc.num_radials;
+
+    for (int p = 0; p < NUM_PRODUCTS; p++) {
+        auto& pd = pc.products[p];
+        if (!pd.has_data) continue;
+        info.has_product[p] = true;
+        info.num_gates[p] = pd.num_gates;
+        info.first_gate_km[p] = pd.first_gate_km;
+        info.gate_spacing_km[p] = pd.gate_spacing_km;
+        info.scale[p] = pd.scale;
+        info.offset[p] = pd.offset;
+    }
+
+    gpu::allocateStation(slot, info);
+    const uint16_t* gatePtrs[NUM_PRODUCTS] = {};
+    for (int p = 0; p < NUM_PRODUCTS; p++)
+        if (pc.products[p].has_data && !pc.products[p].gates.empty())
+            gatePtrs[p] = pc.products[p].gates.data();
+    gpu::uploadStationData(slot, info, pc.azimuths.data(), gatePtrs);
+    gpu::syncStation(slot);
+
+    // Update station state for rendering
+    if (m_stations.size() > 0) {
+        m_stations[0].gpuInfo = info;
+        m_stations[0].uploaded = true;
+        m_stations[0].gpuInfo.lat = fr->station_lat;
+        m_stations[0].gpuInfo.lon = fr->station_lon;
+    }
+    m_activeStationIdx = 0;
+    m_activeTiltAngle = pc.elevation_angle;
+    if ((int)fr->sweeps.size() > m_maxTilts)
+        m_maxTilts = (int)fr->sweeps.size();
+
+    // If cross-section is active, rebuild 3D volume from this frame's ALL sweeps
+    if (m_crossSection) {
+        int ns = (int)fr->sweeps.size();
+        std::vector<GpuStationInfo> sweepInfos(ns);
+        std::vector<const float*> azPtrs(ns);
+        std::vector<const uint16_t*> gatePtrs2(ns);
+
+        for (int s = 0; s < ns && s < 30; s++) {
+            auto& spc = fr->sweeps[s];
+            int tempSlot = 200 + s;
+            if (tempSlot >= MAX_STATIONS) break;
+
+            GpuStationInfo si = {};
+            si.lat = fr->station_lat;
+            si.lon = fr->station_lon;
+            si.elevation_angle = spc.elevation_angle;
+            si.num_radials = spc.num_radials;
+            for (int p = 0; p < NUM_PRODUCTS; p++) {
+                auto& pd = spc.products[p];
+                if (!pd.has_data) continue;
+                si.has_product[p] = true;
+                si.num_gates[p] = pd.num_gates;
+                si.first_gate_km[p] = pd.first_gate_km;
+                si.gate_spacing_km[p] = pd.gate_spacing_km;
+                si.scale[p] = pd.scale;
+                si.offset[p] = pd.offset;
+            }
+            sweepInfos[s] = si;
+
+            gpu::allocateStation(tempSlot, si);
+            const uint16_t* gp[NUM_PRODUCTS] = {};
+            for (int p = 0; p < NUM_PRODUCTS; p++)
+                if (spc.products[p].has_data && !spc.products[p].gates.empty())
+                    gp[p] = spc.products[p].gates.data();
+            gpu::uploadStationData(tempSlot, si, spc.azimuths.data(), gp);
+            gpu::syncStation(tempSlot);
+
+            azPtrs[s] = gpu::getStationAzimuths(tempSlot);
+            gatePtrs2[s] = gpu::getStationGates(tempSlot, m_activeProduct);
+        }
+
+        gpu::buildVolume(0, m_activeProduct,
+                          sweepInfos.data(), ns,
+                          azPtrs.data(), gatePtrs2.data());
+        m_volumeBuilt = true;
+    }
+}
+
+// (Demo pack methods removed)
 
 void App::refreshData() {
     printf("Refreshing data from AWS...\n");

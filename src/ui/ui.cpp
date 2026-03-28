@@ -2,6 +2,7 @@
 #include "../app.h"
 #include "../nexrad/products.h"
 #include "../nexrad/stations.h"
+#include "../historic.h"
 #include <imgui.h>
 #include <cstdio>
 
@@ -55,10 +56,20 @@ void render(App& app) {
     int downloading = app.stationsDownloading();
 
     int asi = app.activeStation();
+    if (app.m_historicMode && app.m_historic.currentEvent()) {
+        auto* ev = app.m_historic.currentEvent();
+        auto* fr = app.m_historic.frame(app.m_historic.currentFrame());
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%s", ev->station);
+        ImGui::SameLine(80);
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "%s", ev->name);
+        ImGui::SameLine(350);
+        ImGui::Text("%s UTC", fr ? fr->timestamp.c_str() : "--:--");
+    } else {
     const char* stName = (asi >= 0 && asi < total) ? NEXRAD_STATIONS[asi].name : "---";
     ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "%s", app.activeStationName());
     ImGui::SameLine(80);
     ImGui::Text("%s", stName);
+    }
     ImGui::SameLine(280);
     ImGui::Text("%s | Tilt %d/%d (%.1f deg)",
                 PRODUCT_INFO[app.activeProduct()].name,
@@ -126,9 +137,88 @@ void render(App& app) {
     if (ImGui::Button("Refresh Data", ImVec2(210, 24)))
         app.refreshData();
 
+    ImGui::Separator();
+
+    // ── Historic Events ─────────────────────────────────────
+    if (ImGui::CollapsingHeader("Historic Tornadoes")) {
+        for (int i = 0; i < NUM_HISTORIC_EVENTS; i++) {
+            auto& ev = HISTORIC_EVENTS[i];
+            if (ImGui::Button(ev.name, ImVec2(210, 22))) {
+                app.loadHistoricEvent(i);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::BeginTooltip();
+                ImGui::Text("%s", ev.description);
+                ImGui::Text("Station: %s  |  %04d-%02d-%02d",
+                            ev.station, ev.year, ev.month, ev.day);
+                ImGui::Text("%02d:%02d - %02d:%02d UTC",
+                            ev.start_hour, ev.start_min, ev.end_hour, ev.end_min);
+                ImGui::EndTooltip();
+            }
+        }
+
+        if (app.m_historicMode) {
+            ImGui::Separator();
+            if (ImGui::Button("Back to Live", ImVec2(210, 24))) {
+                app.m_historicMode = false;
+            }
+        }
+    }
+
+    // (Demo packs removed)
+
     ImGui::End();
 
-    // ── Station list (right panel, collapsible) ─────────────
+    // ── Single-station timeline (historic mode) ─────────────
+    if (app.m_historicMode) {
+        auto& hist = app.m_historic;
+        float barH = 60;
+        ImGui::SetNextWindowPos(ImVec2(240, (float)vp.height - barH));
+        ImGui::SetNextWindowSize(ImVec2((float)vp.width - 500, barH));
+        ImGui::Begin("##timeline", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
+
+        if (hist.loading()) {
+            ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1),
+                               "Downloading: %d / %d frames",
+                               hist.downloadedFrames(), hist.totalFrames());
+            float prog = hist.totalFrames() > 0 ?
+                         (float)hist.downloadedFrames() / hist.totalFrames() : 0;
+            ImGui::ProgressBar(prog, ImVec2(-1, 14));
+        } else if (hist.loaded() && hist.numFrames() > 0) {
+            // Event name + current time
+            const auto* ev = hist.currentEvent();
+            const auto* fr = hist.frame(hist.currentFrame());
+            ImGui::Text("%s  |  %s UTC",
+                        ev ? ev->name : "???",
+                        fr ? fr->timestamp.c_str() : "--:--:--");
+            ImGui::SameLine((float)(vp.width - 500) - 200);
+
+            // Play/pause + speed
+            if (ImGui::Button(hist.playing() ? "Pause" : "Play", ImVec2(60, 20)))
+                hist.togglePlay();
+            ImGui::SameLine();
+            float spd = hist.speed();
+            ImGui::SetNextItemWidth(80);
+            if (ImGui::SliderFloat("##spd", &spd, 1.0f, 15.0f, "%.0f fps"))
+                hist.setSpeed(spd);
+
+            // Timeline scrubber
+            int frame = hist.currentFrame();
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::SliderInt("##frame", &frame, 0, hist.numFrames() - 1)) {
+                hist.setFrame(frame);
+                app.m_lastHistoricFrame = -1; // force re-upload
+            }
+        }
+
+        ImGui::End();
+    }
+
+    // ── Station list (right panel, hide in historic mode) ──
+    if (app.m_historicMode) goto skip_station_list;
+
     ImGui::SetNextWindowPos(ImVec2((float)vp.width - 260, 46));
     ImGui::SetNextWindowSize(ImVec2(250, (float)vp.height - 56));
     ImGui::Begin("Stations", nullptr,
@@ -176,8 +266,10 @@ void render(App& app) {
 
     ImGui::EndChild();
     ImGui::End();
+    skip_station_list:
 
-    // ── Station markers on map (RadarScope-style) ───────────
+    // ── Station markers on map (hide in historic mode) ──────
+    if (app.m_historicMode) goto skip_station_markers;
     {
         auto* dl = ImGui::GetBackgroundDrawList();
         auto& stations2 = app.stations();
@@ -222,6 +314,7 @@ void render(App& app) {
                         textCol, label);
         }
     }
+    skip_station_markers:
 
     // ── Cross-section line overlay ────────────────────────────
     if (app.crossSection()) {
@@ -254,15 +347,21 @@ void render(App& app) {
             ImGui::Image((ImTextureID)(uintptr_t)app.xsTexture().textureId(),
                          ImVec2(imgW, imgH));
 
-            // Altitude labels as overlay on the image
+            // Altitude labels (kft like GR2Analyst)
             ImVec2 imgPos = ImGui::GetItemRectMin();
             auto* wdl = ImGui::GetWindowDrawList();
-            for (int alt = 0; alt <= 20; alt += 2) {
-                float yy = imgPos.y + imgH - (float)alt / 22.0f * imgH;
+            for (int kft = 0; kft <= 45; kft += 5) {
+                float alt_km = (float)kft * 0.3048f; // kft to km
+                float frac = alt_km / 15.0f; // 15km max
+                if (frac > 1.0f) break;
+                float yy = imgPos.y + imgH * (1.0f - frac);
                 char altLabel[16];
-                snprintf(altLabel, sizeof(altLabel), "%dkm", alt);
+                snprintf(altLabel, sizeof(altLabel), "%d kft", kft);
                 wdl->AddText(ImVec2(imgPos.x + 4, yy - 7),
                              IM_COL32(200, 200, 255, 200), altLabel);
+                wdl->AddLine(ImVec2(imgPos.x + 40, yy),
+                             ImVec2(imgPos.x + imgW, yy),
+                             IM_COL32(100, 100, 140, 60), 1.0f);
             }
 
             ImGui::End();
