@@ -487,6 +487,7 @@ void App::render() {
 }
 
 void App::onScroll(double xoff, double yoff) {
+    m_cachedFrameCount = 0; // invalidate animation cache on zoom
     if (m_mode3D) {
         m_camera.distance *= (yoff > 0) ? 0.9f : 1.1f;
         m_camera.distance = std::max(50.0f, std::min(1500.0f, m_camera.distance));
@@ -511,6 +512,7 @@ void App::onMouseDrag(double dx, double dy) {
     } else {
         m_viewport.center_lon -= dx / m_viewport.zoom;
         m_viewport.center_lat += dy / m_viewport.zoom;
+        m_cachedFrameCount = 0; // invalidate animation cache on pan
     }
 }
 
@@ -536,10 +538,6 @@ void App::onMouseMove(double mx, double my) {
 
     if (bestIdx != m_activeStationIdx && bestIdx >= 0) {
         m_activeStationIdx = bestIdx;
-        // Re-upload with active product/tilt for the new station
-        if (m_stations[bestIdx].parsed && !m_stations[bestIdx].precomputed.empty()) {
-            uploadStation(bestIdx);
-        }
     }
 }
 
@@ -687,57 +685,68 @@ void App::toggle3D() {
     m_mode3D = !m_mode3D;
     m_showAll = false;
     if (m_mode3D) {
-        // Build 3D volume for active station using all tilts
-        if (m_activeStationIdx >= 0 && m_activeStationIdx < (int)m_stations.size()) {
+        // Helper lambda to build volume from a vector of PrecomputedSweeps
+        auto buildVolumeFromSweeps = [&](const std::vector<PrecomputedSweep>& sweeps,
+                                          float slat, float slon, int stationSlot) {
+            int ns = (int)sweeps.size();
+            if (ns == 0) return;
+            std::vector<GpuStationInfo> sweepInfos(ns);
+            std::vector<const float*> azPtrs(ns);
+            std::vector<const uint16_t*> gatePtrs(ns);
+
+            for (int s = 0; s < ns && s < 30; s++) {
+                auto& pc = sweeps[s];
+                int slot = 200 + s;
+                if (slot >= MAX_STATIONS) break;
+
+                GpuStationInfo info = {};
+                info.lat = slat;
+                info.lon = slon;
+                info.elevation_angle = pc.elevation_angle;
+                info.num_radials = pc.num_radials;
+                for (int p = 0; p < NUM_PRODUCTS; p++) {
+                    auto& pd = pc.products[p];
+                    if (!pd.has_data) continue;
+                    info.has_product[p] = true;
+                    info.num_gates[p] = pd.num_gates;
+                    info.first_gate_km[p] = pd.first_gate_km;
+                    info.gate_spacing_km[p] = pd.gate_spacing_km;
+                    info.scale[p] = pd.scale;
+                    info.offset[p] = pd.offset;
+                }
+                sweepInfos[s] = info;
+
+                gpu::allocateStation(slot, info);
+                const uint16_t* gp[NUM_PRODUCTS] = {};
+                for (int p = 0; p < NUM_PRODUCTS; p++)
+                    if (pc.products[p].has_data && !pc.products[p].gates.empty())
+                        gp[p] = pc.products[p].gates.data();
+                gpu::uploadStationData(slot, info, pc.azimuths.data(), gp);
+                gpu::syncStation(slot);
+
+                azPtrs[s] = gpu::getStationAzimuths(slot);
+                gatePtrs[s] = gpu::getStationGates(slot, m_activeProduct);
+            }
+
+            gpu::buildVolume(stationSlot, m_activeProduct,
+                              sweepInfos.data(), ns,
+                              azPtrs.data(), gatePtrs.data());
+            m_volumeBuilt = true;
+            m_volumeStation = stationSlot;
+        };
+
+        if (m_historicMode) {
+            // Build volume from historic frame's sweeps
+            const RadarFrame* fr = m_historic.frame(m_historic.currentFrame());
+            if (fr && fr->ready && !fr->sweeps.empty()) {
+                buildVolumeFromSweeps(fr->sweeps, fr->station_lat, fr->station_lon, 0);
+            }
+        } else if (m_activeStationIdx >= 0 && m_activeStationIdx < (int)m_stations.size()) {
             auto& st = m_stations[m_activeStationIdx];
             if (!st.precomputed.empty()) {
-                int ns = (int)st.precomputed.size();
-                std::vector<GpuStationInfo> sweepInfos(ns);
-                std::vector<const float*> azPtrs(ns);
-                std::vector<const uint16_t*> gatePtrs(ns);
-
-                // Upload all sweeps for this station
-                for (int s = 0; s < ns; s++) {
-                    auto& pc = st.precomputed[s];
-                    // We need to upload each sweep's data temporarily
-                    // Reuse station slots starting at a high index
-                    int slot = 200 + s; // temp GPU slots
-                    if (slot >= MAX_STATIONS) break;
-
-                    GpuStationInfo info = {};
-                    info.lat = st.gpuInfo.lat;
-                    info.lon = st.gpuInfo.lon;
-                    info.elevation_angle = pc.elevation_angle;
-                    info.num_radials = pc.num_radials;
-                    for (int p = 0; p < NUM_PRODUCTS; p++) {
-                        auto& pd = pc.products[p];
-                        if (!pd.has_data) continue;
-                        info.has_product[p] = true;
-                        info.num_gates[p] = pd.num_gates;
-                        info.first_gate_km[p] = pd.first_gate_km;
-                        info.gate_spacing_km[p] = pd.gate_spacing_km;
-                        info.scale[p] = pd.scale;
-                        info.offset[p] = pd.offset;
-                    }
-                    sweepInfos[s] = info;
-
-                    gpu::allocateStation(slot, info);
-                    const uint16_t* gp[NUM_PRODUCTS] = {};
-                    for (int p = 0; p < NUM_PRODUCTS; p++)
-                        if (pc.products[p].has_data && !pc.products[p].gates.empty())
-                            gp[p] = pc.products[p].gates.data();
-                    gpu::uploadStationData(slot, info, pc.azimuths.data(), gp);
-                    gpu::syncStation(slot);
-
-                    azPtrs[s] = gpu::getStationAzimuths(slot);
-                    gatePtrs[s] = gpu::getStationGates(slot, m_activeProduct);
-                }
-
-                gpu::buildVolume(m_activeStationIdx, m_activeProduct,
-                                  sweepInfos.data(), ns,
-                                  azPtrs.data(), gatePtrs.data());
-                m_volumeBuilt = true;
-                m_volumeStation = m_activeStationIdx;
+                float slat = st.gpuInfo.lat != 0 ? st.gpuInfo.lat : st.lat;
+                float slon = st.gpuInfo.lon != 0 ? st.gpuInfo.lon : st.lon;
+                buildVolumeFromSweeps(st.precomputed, slat, slon, m_activeStationIdx);
             }
         }
     }

@@ -764,8 +764,15 @@ __global__ void forwardRenderKernel(
 
     // Compute 4 corners of this polar quad in screen space
     int ri_next = (ri + 1) % nr;
-    float az0 = azimuths[ri] * ((float)M_PI / 180.0f);
-    float az1 = azimuths[ri_next] * ((float)M_PI / 180.0f);
+    float az0_deg = __ldg(&azimuths[ri]);
+    float az1_deg = __ldg(&azimuths[ri_next]);
+    // Handle 360->0 wraparound: skip this gate if angular gap > 5 degrees
+    float az_gap = az1_deg - az0_deg;
+    if (az_gap < -180.0f) az_gap += 360.0f;
+    if (az_gap > 180.0f) az_gap -= 360.0f;
+    if (fabsf(az_gap) > 5.0f) return; // degenerate wrap-around quad
+    float az0 = az0_deg * ((float)M_PI / 180.0f);
+    float az1 = az1_deg * ((float)M_PI / 180.0f);
     float gskm = info.gate_spacing_km[product];
     float r0 = info.first_gate_km[product] + gi * gskm;
     float r1 = r0 + gskm;
@@ -781,8 +788,9 @@ __global__ void forwardRenderKernel(
     int iy0 = max(0, (int)floorf(fminf(fminf(c0.y, c1.y), fminf(c2.y, c3.y))));
     int iy1 = min(vp.height - 1, (int)ceilf(fmaxf(fmaxf(c0.y, c1.y), fmaxf(c2.y, c3.y))));
 
-    // Skip if entirely off-screen
+    // Skip if entirely off-screen or degenerate (too many pixels = bad quad)
     if (ix0 > ix1 || iy0 > iy1) return;
+    if ((ix1 - ix0) * (iy1 - iy0) > 10000) return; // cap fill area
 
     // Edge functions for convex quad (CCW winding in screen space)
     // Screen space is Y-down, so reverse order for CCW
