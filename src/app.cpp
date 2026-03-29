@@ -241,7 +241,8 @@ void suppressReflectivityRingArtifacts(std::vector<PrecomputedSweep>& sweeps) {
 
 } // namespace
 
-App::App() {}
+App::App()
+    : m_spatialGrid(std::make_unique<SpatialGrid>()) {}
 
 App::~App() {
     if (m_downloader) m_downloader->shutdown();
@@ -307,7 +308,27 @@ bool App::init(int windowWidth, int windowHeight) {
     return true;
 }
 
+bool App::isCurrentDownloadGeneration(uint64_t generation) const {
+    return generation == m_downloadGeneration.load();
+}
+
+void App::failDownload(int stationIdx, uint64_t generation, std::string error) {
+    std::lock_guard<std::mutex> lock(m_stationMutex);
+    if (!isCurrentDownloadGeneration(generation)) return;
+    if (stationIdx < 0 || stationIdx >= (int)m_stations.size()) return;
+
+    auto& st = m_stations[stationIdx];
+    st.failed = true;
+    st.error = std::move(error);
+    if (st.downloading) {
+        st.downloading = false;
+        m_stationsDownloading--;
+    }
+}
+
 void App::startDownloads() {
+    const uint64_t generation = m_downloadGeneration.load();
+    const bool dealiasEnabled = m_dealias;
     int year, month, day;
     getUtcDate(year, month, day);
 
@@ -315,12 +336,17 @@ void App::startDownloads() {
            year, month, day, m_stationsTotal);
 
     for (int i = 0; i < m_stationsTotal; i++) {
-        auto& st = m_stations[i];
-        if (st.downloading) continue;
-        st.downloading = true;
+        {
+            std::lock_guard<std::mutex> lock(m_stationMutex);
+            auto& st = m_stations[i];
+            if (st.downloading) continue;
+            st.downloading = true;
+            st.failed = false;
+            st.error.clear();
+        }
         m_stationsDownloading++;
 
-        std::string station = st.icao;
+        std::string station = m_stations[i].icao;
         int idx = i;
 
         // First: list files for this station
@@ -330,14 +356,13 @@ void App::startDownloads() {
             station + "_list",
             NEXRAD_HOST,
             "/?list-type=2&prefix=" + std::string(listPath.data() + 1), // strip leading /
-            [this, idx, station](const std::string& id, DownloadResult listResult) {
+            [this, idx, station, generation, dealiasEnabled](const std::string& id, DownloadResult listResult) {
+                if (!isCurrentDownloadGeneration(generation)) return;
                 if (!listResult.success || listResult.data.empty()) {
                     // Try previous day
                     int y, m, d;
                     getUtcDate(y, m, d);
-                    // Simple day-1 (doesn't handle month boundaries perfectly)
-                    d--;
-                    if (d < 1) { d = 28; m--; if (m < 1) { m = 12; y--; } }
+                    shiftDate(y, m, d, -1);
 
                     std::string path2 = "/?list-type=2&prefix=" +
                         std::to_string(y) + "/" +
@@ -347,26 +372,20 @@ void App::startDownloads() {
 
                     auto retry = Downloader::httpGet(NEXRAD_HOST, path2);
                     if (!retry.success) {
-                        std::lock_guard<std::mutex> lock(m_stationMutex);
-                        m_stations[idx].failed = true;
-                        m_stations[idx].error = "No data available";
-                        m_stations[idx].downloading = false;
-                        m_stationsDownloading--;
+                        failDownload(idx, generation, "No data available");
                         return;
                     }
                     listResult = std::move(retry);
                 }
+
+                if (!isCurrentDownloadGeneration(generation)) return;
 
                 // Parse file list
                 std::string xml(listResult.data.begin(), listResult.data.end());
                 auto files = parseS3ListResponse(xml);
 
                 if (files.empty()) {
-                    std::lock_guard<std::mutex> lock(m_stationMutex);
-                    m_stations[idx].failed = true;
-                    m_stations[idx].error = "No files found";
-                    m_stations[idx].downloading = false;
-                    m_stationsDownloading--;
+                    failDownload(idx, generation, "No files found");
                     return;
                 }
 
@@ -374,17 +393,15 @@ void App::startDownloads() {
                 // The very last file may still be in progress
                 int fileIdx = (files.size() >= 2) ? (int)files.size() - 2 : 0;
                 std::string fileKey = files[fileIdx].key;
+                if (!isCurrentDownloadGeneration(generation)) return;
                 auto fileResult = Downloader::httpGet(NEXRAD_HOST, "/" + fileKey);
 
                 if (fileResult.success && !fileResult.data.empty()) {
-                    processDownload(idx, std::move(fileResult.data));
+                    processDownload(idx, std::move(fileResult.data), generation,
+                                    false, false, dealiasEnabled);
                 } else {
-                    std::lock_guard<std::mutex> lock(m_stationMutex);
-                    m_stations[idx].failed = true;
-                    m_stations[idx].error = fileResult.error;
-                    m_stations[idx].downloading = false;
+                    failDownload(idx, generation, fileResult.error);
                 }
-                m_stationsDownloading--;
             }
         );
     }
@@ -415,6 +432,7 @@ void App::resetStationsForReload() {
         st.uploaded_product = -1;
         st.uploaded_tilt = -1;
         st.uploaded_sweep = -1;
+        st.uploaded_lowest_sweep = false;
     }
 
     m_stationsLoaded = 0;
@@ -433,17 +451,26 @@ void App::resetStationsForReload() {
 }
 
 void App::startDownloadsForTimestamp(int year, int month, int day, int hour, int minute) {
+    const uint64_t generation = m_downloadGeneration.load();
+    const bool snapshotMode = m_snapshotMode;
+    const bool lowestSweepOnly = m_snapshotLowestSweepOnly;
+    const bool dealiasEnabled = m_dealias;
     const int targetSeconds = hour * 3600 + minute * 60;
     printf("Fetching archive snapshot for %04d-%02d-%02d %02d:%02d UTC from %d stations...\n",
            year, month, day, hour, minute, m_stationsTotal);
 
     for (int i = 0; i < m_stationsTotal; i++) {
-        auto& st = m_stations[i];
-        if (st.downloading) continue;
-        st.downloading = true;
+        {
+            std::lock_guard<std::mutex> lock(m_stationMutex);
+            auto& st = m_stations[i];
+            if (st.downloading) continue;
+            st.downloading = true;
+            st.failed = false;
+            st.error.clear();
+        }
         m_stationsDownloading++;
 
-        std::string station = st.icao;
+        std::string station = m_stations[i].icao;
         int idx = i;
         std::string listPath = buildListUrl(station, year, month, day);
 
@@ -451,24 +478,17 @@ void App::startDownloadsForTimestamp(int year, int month, int day, int hour, int
             station + "_archive_list",
             NEXRAD_HOST,
             "/?list-type=2&prefix=" + std::string(listPath.data() + 1) + "&max-keys=1000",
-            [this, idx, station, targetSeconds](const std::string& id, DownloadResult listResult) {
+            [this, idx, station, targetSeconds, generation, snapshotMode, lowestSweepOnly, dealiasEnabled](const std::string& id, DownloadResult listResult) {
+                if (!isCurrentDownloadGeneration(generation)) return;
                 if (!listResult.success || listResult.data.empty()) {
-                    std::lock_guard<std::mutex> lock(m_stationMutex);
-                    m_stations[idx].failed = true;
-                    m_stations[idx].error = "Archive listing failed";
-                    m_stations[idx].downloading = false;
-                    m_stationsDownloading--;
+                    failDownload(idx, generation, "Archive listing failed");
                     return;
                 }
 
                 std::string xml(listResult.data.begin(), listResult.data.end());
                 auto files = parseS3ListResponse(xml);
                 if (files.empty()) {
-                    std::lock_guard<std::mutex> lock(m_stationMutex);
-                    m_stations[idx].failed = true;
-                    m_stations[idx].error = "No archive files found";
-                    m_stations[idx].downloading = false;
-                    m_stationsDownloading--;
+                    failDownload(idx, generation, "No archive files found");
                     return;
                 }
 
@@ -486,40 +506,33 @@ void App::startDownloadsForTimestamp(int year, int month, int day, int hour, int
                 }
 
                 if (bestIdx < 0) {
-                    std::lock_guard<std::mutex> lock(m_stationMutex);
-                    m_stations[idx].failed = true;
-                    m_stations[idx].error = "No timestamped archive volume";
-                    m_stations[idx].downloading = false;
-                    m_stationsDownloading--;
+                    failDownload(idx, generation, "No timestamped archive volume");
                     return;
                 }
 
+                if (!isCurrentDownloadGeneration(generation)) return;
                 auto fileResult = Downloader::httpGet(NEXRAD_HOST, "/" + files[bestIdx].key);
                 if (fileResult.success && !fileResult.data.empty()) {
-                    processDownload(idx, std::move(fileResult.data));
+                    processDownload(idx, std::move(fileResult.data), generation,
+                                    snapshotMode, lowestSweepOnly, dealiasEnabled);
                 } else {
-                    std::lock_guard<std::mutex> lock(m_stationMutex);
-                    m_stations[idx].failed = true;
-                    m_stations[idx].error = fileResult.error.empty()
-                        ? "Archive download failed"
-                        : fileResult.error;
-                    m_stations[idx].downloading = false;
+                    failDownload(idx, generation,
+                                 fileResult.error.empty() ? "Archive download failed"
+                                                          : fileResult.error);
                 }
-                m_stationsDownloading--;
             }
         );
     }
 }
 
-void App::processDownload(int stationIdx, std::vector<uint8_t> data) {
+void App::processDownload(int stationIdx, std::vector<uint8_t> data, uint64_t generation,
+                          bool snapshotMode, bool lowestSweepOnly, bool dealiasEnabled) {
+    if (!isCurrentDownloadGeneration(generation)) return;
     // CPU: BZ2 decompression only (inherently sequential algorithm)
     auto parsed = Level2Parser::parse(data);
 
     if (parsed.sweeps.empty()) {
-        std::lock_guard<std::mutex> lock(m_stationMutex);
-        m_stations[stationIdx].failed = true;
-        m_stations[stationIdx].error = "Parse failed: no sweeps";
-        m_stations[stationIdx].downloading = false;
+        failDownload(stationIdx, generation, "Parse failed: no sweeps");
         return;
     }
 
@@ -582,7 +595,7 @@ void App::processDownload(int stationIdx, std::vector<uint8_t> data) {
         }
     }
 
-    if (m_snapshotMode && m_snapshotLowestSweepOnly) {
+    if (snapshotMode && lowestSweepOnly) {
         int lowestIdx = findLowestSweepIndex(precomp);
         if (lowestIdx >= 0) {
             std::vector<PrecomputedSweep> reducedPrecomp;
@@ -597,20 +610,26 @@ void App::processDownload(int stationIdx, std::vector<uint8_t> data) {
         }
     }
 
-    if (m_snapshotMode) {
+    if (snapshotMode) {
         suppressReflectivityRingArtifacts(precomp);
     }
 
     {
         std::lock_guard<std::mutex> lock(m_stationMutex);
+        if (!isCurrentDownloadGeneration(generation)) return;
         m_stations[stationIdx].parsedData = std::move(parsed);
         m_stations[stationIdx].precomputed = std::move(precomp);
         m_stations[stationIdx].parsed = true;
-        m_stations[stationIdx].downloading = false;
+        m_stations[stationIdx].failed = false;
+        m_stations[stationIdx].error.clear();
+        if (m_stations[stationIdx].downloading) {
+            m_stations[stationIdx].downloading = false;
+            m_stationsDownloading--;
+        }
         m_stations[stationIdx].lastUpdate = std::chrono::steady_clock::now();
 
         // Run velocity dealiasing on parsed data
-        if (m_dealias) dealias(stationIdx);
+        if (dealiasEnabled) dealias(stationIdx);
 
         // Compute detection features (TDS, hail, meso)
         computeDetection(stationIdx);
@@ -618,7 +637,8 @@ void App::processDownload(int stationIdx, std::vector<uint8_t> data) {
 
     {
         std::lock_guard<std::mutex> lock(m_uploadMutex);
-        m_uploadQueue.push_back(stationIdx);
+        if (isCurrentDownloadGeneration(generation))
+            m_uploadQueue.push_back(stationIdx);
     }
 }
 
@@ -724,9 +744,14 @@ std::vector<StationUiState> App::stations() const {
 }
 
 bool App::stationUploadMatchesSelection(const StationState& st) const {
-    return st.uploaded &&
-           st.uploaded_product == m_activeProduct &&
-           st.uploaded_tilt == m_activeTilt;
+    const bool lowestSweepUpload = m_showAll || m_snapshotMode;
+    if (!st.uploaded ||
+        st.uploaded_product != m_activeProduct ||
+        st.uploaded_lowest_sweep != lowestSweepUpload) {
+        return false;
+    }
+
+    return lowestSweepUpload || st.uploaded_tilt == m_activeTilt;
 }
 
 void App::invalidateFrameCache(bool freeMemory) {
@@ -829,12 +854,17 @@ void App::rebuildVolumeForCurrentSelection() {
 
     if (m_activeStationIdx < 0 || m_activeStationIdx >= (int)m_stations.size()) return;
 
-    auto& st = m_stations[m_activeStationIdx];
-    if (!stationUploadMatchesSelection(st))
+    bool needsUpload = false;
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        needsUpload = !stationUploadMatchesSelection(m_stations[m_activeStationIdx]);
+    }
+    if (needsUpload)
         uploadStation(m_activeStationIdx);
-    if (!stationUploadMatchesSelection(st)) return;
 
-    if (st.precomputed.empty()) return;
+    std::lock_guard<std::mutex> lock(m_stationMutex);
+    const auto& st = m_stations[m_activeStationIdx];
+    if (!stationUploadMatchesSelection(st) || st.precomputed.empty()) return;
 
     float slat = st.gpuInfo.lat != 0 ? st.gpuInfo.lat : st.lat;
     float slon = st.gpuInfo.lon != 0 ? st.gpuInfo.lon : st.lon;
@@ -854,6 +884,7 @@ void App::refreshActiveTiltMetadata() {
     }
 
     if (m_activeStationIdx < 0 || m_activeStationIdx >= (int)m_stations.size()) return;
+    std::lock_guard<std::mutex> lock(m_stationMutex);
     const auto& st = m_stations[m_activeStationIdx];
     if (st.precomputed.empty()) return;
 
@@ -865,6 +896,7 @@ void App::refreshActiveTiltMetadata() {
 }
 
 void App::uploadStation(int stationIdx) {
+    std::lock_guard<std::mutex> lock(m_stationMutex);
     auto& st = m_stations[stationIdx];
     if (st.precomputed.empty()) return;
 
@@ -877,6 +909,7 @@ void App::uploadStation(int stationIdx) {
         st.uploaded_product = -1;
         st.uploaded_tilt = -1;
         st.uploaded_sweep = -1;
+        st.uploaded_lowest_sweep = false;
         m_gridDirty = true;
         return;
     }
@@ -927,6 +960,7 @@ void App::uploadStation(int stationIdx) {
     st.uploaded_product = m_activeProduct;
     st.uploaded_tilt = m_activeTilt;
     st.uploaded_sweep = sweepIdx;
+    st.uploaded_lowest_sweep = lowestSweepMosaic;
     if (!st.uploaded) {
         st.uploaded = true;
         int loaded = ++m_stationsLoaded;
@@ -938,6 +972,8 @@ void App::uploadStation(int stationIdx) {
 }
 
 void App::buildSpatialGrid() {
+    if (!m_spatialGrid) return;
+
     // GPU spatial grid construction
     std::vector<GpuStationInfo> infos(m_stations.size());
     {
@@ -946,7 +982,7 @@ void App::buildSpatialGrid() {
             infos[i] = m_stations[i].gpuInfo;
     }
 
-    gpu::buildSpatialGridGpu(infos.data(), (int)infos.size(), &m_spatialGrid);
+    gpu::buildSpatialGridGpu(infos.data(), (int)infos.size(), m_spatialGrid.get());
     m_gridDirty = false;
 }
 
@@ -1049,12 +1085,16 @@ void App::render() {
                     gpuInfos[i] = m_stations[i].gpuInfo;
             }
             gpu::renderNative(gpuVp, gpuInfos.data(), (int)m_stations.size(),
-                              m_spatialGrid, m_activeProduct, activeThreshold,
+                              *m_spatialGrid, m_activeProduct, activeThreshold,
                               m_d_compositeOutput);
         } else if (m_activeStationIdx >= 0) {
             // Single station: fast path
-            if (m_activeStationIdx < (int)m_stations.size() &&
-                !stationUploadMatchesSelection(m_stations[m_activeStationIdx])) {
+            bool needsUpload = false;
+            if (m_activeStationIdx < (int)m_stations.size()) {
+                std::lock_guard<std::mutex> lock(m_stationMutex);
+                needsUpload = !stationUploadMatchesSelection(m_stations[m_activeStationIdx]);
+            }
+            if (needsUpload) {
                 uploadStation(m_activeStationIdx);
             }
             gpu::forwardRenderStation(gpuVp, m_activeStationIdx,
@@ -1069,7 +1109,11 @@ void App::render() {
         int xsStationSlot = m_historicMode ? 0 : m_activeStationIdx;
         if (m_crossSection && m_volumeBuilt && xsStationSlot >= 0 &&
             xsStationSlot < (int)m_stations.size()) {
-            auto& st = m_stations[xsStationSlot];
+            GpuStationInfo stInfo = {};
+            {
+                std::lock_guard<std::mutex> lock(m_stationMutex);
+                stInfo = m_stations[xsStationSlot].gpuInfo;
+            }
             m_xsWidth = gpuVp.width;
             m_xsHeight = gpuVp.height / 3;
             if (m_xsHeight < 200) m_xsHeight = 200;
@@ -1081,7 +1125,7 @@ void App::render() {
             gpu::renderCrossSection(
                 m_activeStationIdx, m_activeProduct, activeThreshold,
                 m_xsStartLat, m_xsStartLon, m_xsEndLat, m_xsEndLon,
-                st.gpuInfo.lat, st.gpuInfo.lon,
+                stInfo.lat, stInfo.lon,
                 m_xsWidth, m_xsHeight, m_d_xsOutput);
 
             // Copy to its own GL texture
@@ -1132,29 +1176,38 @@ void App::onMouseMove(double mx, double my) {
     // Find nearest uploaded station
     float bestDist = 1e9f;
     int bestIdx = -1;
-    for (int i = 0; i < (int)m_stations.size(); i++) {
-        if (!m_stations[i].uploaded) continue;
-        float dlat = m_mouseLat - m_stations[i].gpuInfo.lat;
-        float dlon = (m_mouseLon - m_stations[i].gpuInfo.lon) *
-                     cosf(m_stations[i].gpuInfo.lat * 3.14159f / 180.0f);
-        float dist = dlat * dlat + dlon * dlon;
-        if (dist < bestDist) {
-            bestDist = dist;
-            bestIdx = i;
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        for (int i = 0; i < (int)m_stations.size(); i++) {
+            if (!m_stations[i].uploaded) continue;
+            float dlat = m_mouseLat - m_stations[i].gpuInfo.lat;
+            float dlon = (m_mouseLon - m_stations[i].gpuInfo.lon) *
+                         cosf(m_stations[i].gpuInfo.lat * 3.14159f / 180.0f);
+            float dist = dlat * dlat + dlon * dlon;
+            if (dist < bestDist) {
+                bestDist = dist;
+                bestIdx = i;
+            }
         }
     }
 
     if (bestIdx != m_activeStationIdx && bestIdx >= 0) {
         m_activeStationIdx = bestIdx;
-        if (!stationUploadMatchesSelection(m_stations[bestIdx]))
+        bool needsUpload = false;
+        {
+            std::lock_guard<std::mutex> lock(m_stationMutex);
+            needsUpload = !stationUploadMatchesSelection(m_stations[bestIdx]);
+        }
+        if (needsUpload)
             uploadStation(bestIdx);
     }
 }
 
-const char* App::activeStationName() const {
+std::string App::activeStationName() const {
+    std::lock_guard<std::mutex> lock(m_stationMutex);
     if (m_activeStationIdx < 0 || m_activeStationIdx >= m_stationsTotal)
         return "None";
-    return m_stations[m_activeStationIdx].icao.c_str();
+    return m_stations[m_activeStationIdx].icao;
 }
 
 void App::onResize(int w, int h) {
@@ -1191,8 +1244,7 @@ void App::setProduct(int p) {
             rebuildVolumeForCurrentSelection();
     } else {
         for (int i = 0; i < (int)m_stations.size(); i++) {
-            if (m_stations[i].parsed && !m_stations[i].precomputed.empty())
-                uploadStation(i);
+            uploadStation(i);
         }
         if (m_crossSection || m_mode3D)
             rebuildVolumeForCurrentSelection();
@@ -1218,11 +1270,10 @@ void App::setTilt(int t) {
     } else {
         // Re-upload all stations with new tilt
         for (int i = 0; i < (int)m_stations.size(); i++) {
-            if (m_stations[i].parsed && !m_stations[i].precomputed.empty())
-                uploadStation(i);
+            uploadStation(i);
         }
         for (int i = 0; i < (int)m_stations.size(); i++) {
-            if (m_stations[i].uploaded) gpu::syncStation(i);
+            gpu::syncStation(i);
         }
     }
     if (m_crossSection || m_mode3D)
@@ -1240,6 +1291,8 @@ void App::setDbzMinThreshold(float v) {
         : &m_dbzMinThreshold;
     if (v == *target) return;
     *target = v;
+    if (m_historicMode)
+        invalidateFrameCache(true);
     m_needsRerender = true;
 }
 
@@ -1283,6 +1336,7 @@ void App::toggleCrossSection() {
             auto* fr = m_historic.frame(m_historic.currentFrame());
             if (fr && fr->ready) { slat = fr->station_lat; slon = fr->station_lon; }
         } else if (m_activeStationIdx >= 0) {
+            std::lock_guard<std::mutex> lock(m_stationMutex);
             slat = m_stations[m_activeStationIdx].gpuInfo.lat;
             slon = m_stations[m_activeStationIdx].gpuInfo.lon;
         }
@@ -1395,11 +1449,13 @@ void App::uploadHistoricFrame(int frameIdx) {
 
     // Update station state for rendering
     if (m_stations.size() > 0) {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
         m_stations[0].gpuInfo = info;
         m_stations[0].uploaded = true;
         m_stations[0].uploaded_product = m_activeProduct;
         m_stations[0].uploaded_tilt = m_activeTilt;
         m_stations[0].uploaded_sweep = sweepIdx;
+        m_stations[0].uploaded_lowest_sweep = false;
         m_stations[0].gpuInfo.lat = fr->station_lat;
         m_stations[0].gpuInfo.lon = fr->station_lon;
     }
@@ -1417,14 +1473,24 @@ void App::uploadHistoricFrame(int frameIdx) {
 void App::refreshData() {
     printf("Refreshing data from AWS...\n");
     m_lastRefresh = std::chrono::steady_clock::now();
-    m_snapshotMode = false;
-    m_snapshotLowestSweepOnly = false;
-    m_snapshotLabel.clear();
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        ++m_downloadGeneration;
+        m_snapshotMode = false;
+        m_snapshotLowestSweepOnly = false;
+        m_snapshotLabel.clear();
+        m_stationsDownloading = 0;
 
-    // Reset download states and re-download
-    for (auto& st : m_stations) {
-        st.downloading = false;
-        // Don't reset parsed/uploaded - keep showing old data until new arrives
+        // Keep current rendered data visible until replacement downloads arrive.
+        for (auto& st : m_stations) {
+            st.downloading = false;
+            st.failed = false;
+            st.error.clear();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_uploadMutex);
+        m_uploadQueue.clear();
     }
     startDownloads();
 }
@@ -1446,6 +1512,10 @@ void App::loadMarch302025Snapshot(bool lowestSweepOnly) {
     m_viewport.center_lat = 39.0;
     m_viewport.center_lon = -98.0;
     m_viewport.zoom = 28.0;
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        ++m_downloadGeneration;
+    }
     invalidateFrameCache(true);
     resetStationsForReload();
     startDownloadsForTimestamp(2025, 3, 30, 21, 0);

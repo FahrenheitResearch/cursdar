@@ -1,5 +1,4 @@
 #ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #endif
 
@@ -113,10 +112,11 @@ int main(int argc, char** argv) {
             fps = frameCount / fpsTimer;
             frameCount = 0;
             fpsTimer = 0;
+            std::string activeStation = app.activeStationName();
             char title[128];
             snprintf(title, sizeof(title),
                      "CURSDAR - %s | %s | Tilt %.1f | %d stations | %.0f FPS",
-                     app.activeStationName(),
+                     activeStation.c_str(),
                      PRODUCT_INFO[app.activeProduct()].name,
                      app.activeTiltAngle(),
                      app.stationsLoaded(), fps);

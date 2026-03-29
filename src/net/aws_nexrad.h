@@ -43,6 +43,44 @@ inline void getUtcDate(int& year, int& month, int& day) {
     day = utc.tm_mday;
 }
 
+inline bool isLeapYear(int year) {
+    return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+}
+
+inline int daysInMonth(int year, int month) {
+    static const int kDaysPerMonth[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (month == 2) return isLeapYear(year) ? 29 : 28;
+    return kDaysPerMonth[month - 1];
+}
+
+inline void shiftDate(int& year, int& month, int& day, int deltaDays) {
+    while (deltaDays < 0) {
+        day--;
+        if (day < 1) {
+            month--;
+            if (month < 1) {
+                month = 12;
+                year--;
+            }
+            day = daysInMonth(year, month);
+        }
+        deltaDays++;
+    }
+
+    while (deltaDays > 0) {
+        day++;
+        if (day > daysInMonth(year, month)) {
+            day = 1;
+            month++;
+            if (month > 12) {
+                month = 1;
+                year++;
+            }
+        }
+        deltaDays--;
+    }
+}
+
 // Parse S3 XML list response to extract file keys
 // Simple tag extraction - no XML library needed
 inline std::vector<NexradFile> parseS3ListResponse(const std::string& xml) {

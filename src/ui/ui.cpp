@@ -174,7 +174,8 @@ void render(App& app) {
         ImGui::Text("%s UTC", fr ? fr->timestamp.c_str() : "--:--");
     } else {
     const char* stName = (asi >= 0 && asi < total) ? NEXRAD_STATIONS[asi].name : "---";
-    ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "%s", app.activeStationName());
+    std::string activeStation = app.activeStationName();
+    ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "%s", activeStation.c_str());
     ImGui::SameLine(80);
     ImGui::Text("%s", stName);
     if (app.snapshotMode()) {

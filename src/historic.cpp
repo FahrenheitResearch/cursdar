@@ -208,13 +208,13 @@ void HistoricLoader::loadEvent(int eventIdx, ProgressCallback cb) {
 
         // Also check next day for overnight events
         if (ev.end_hour < ev.start_hour) {
-            int nextDay = ev.day + 1;
+            int nextYear = ev.year;
             int nextMonth = ev.month;
-            // Simple day rollover (not perfect for month boundaries)
-            if (nextDay > 28) { nextDay = 1; nextMonth++; }
+            int nextDay = ev.day;
+            shiftDate(nextYear, nextMonth, nextDay, 1);
 
             std::string listPath2 = "/?list-type=2&prefix=" +
-                std::to_string(ev.year) + "/" +
+                std::to_string(nextYear) + "/" +
                 (nextMonth < 10 ? "0" : "") + std::to_string(nextMonth) + "/" +
                 (nextDay < 10 ? "0" : "") + std::to_string(nextDay) + "/" +
                 std::string(ev.station) + "/&max-keys=1000";

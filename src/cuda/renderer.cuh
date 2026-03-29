@@ -44,7 +44,7 @@ struct GpuViewport {
 // Spatial grid cell for fast station lookup
 constexpr int SPATIAL_GRID_W = 128;
 constexpr int SPATIAL_GRID_H = 64;
-constexpr int MAX_STATIONS_PER_CELL = 8;
+constexpr int MAX_STATIONS_PER_CELL = 32;
 
 struct SpatialGrid {
     int cells[SPATIAL_GRID_H][SPATIAL_GRID_W][MAX_STATIONS_PER_CELL];

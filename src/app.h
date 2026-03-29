@@ -46,6 +46,7 @@ struct StationState {
     int uploaded_product = -1;
     int uploaded_tilt = -1;
     int uploaded_sweep = -1;
+    bool uploaded_lowest_sweep = false;
 };
 
 struct StationUiState {
@@ -87,7 +88,7 @@ public:
 
     // Active station (nearest to mouse)
     int  activeStation() const { return m_activeStationIdx; }
-    const char* activeStationName() const;
+    std::string activeStationName() const;
     bool showAll() const { return m_showAll; }
     void toggleShowAll() { m_showAll = !m_showAll; m_mode3D = false; }
     bool mode3D() const { return m_mode3D; }
@@ -147,7 +148,8 @@ private:
     void startDownloads();
 
     // Process a completed download
-    void processDownload(int stationIdx, std::vector<uint8_t> data);
+    void processDownload(int stationIdx, std::vector<uint8_t> data, uint64_t generation,
+                         bool snapshotMode, bool lowestSweepOnly, bool dealiasEnabled);
 
     // Upload parsed data to GPU
     void uploadStation(int stationIdx);
@@ -158,6 +160,8 @@ private:
     void ensureCrossSectionBuffer(int width, int height);
     void rebuildVolumeForCurrentSelection();
     bool stationUploadMatchesSelection(const StationState& st) const;
+    bool isCurrentDownloadGeneration(uint64_t generation) const;
+    void failDownload(int stationIdx, uint64_t generation, std::string error);
     void refreshActiveTiltMetadata();
     void resetStationsForReload();
     void startDownloadsForTimestamp(int year, int month, int day, int hour, int minute);
@@ -186,11 +190,12 @@ private:
     GlCudaTexture   m_outputTex;
 
     // Spatial grid for fast station lookup in compositor
-    SpatialGrid     m_spatialGrid;
+    std::unique_ptr<SpatialGrid> m_spatialGrid;
     bool            m_gridDirty = true;
 
     // Download manager
     std::unique_ptr<Downloader> m_downloader;
+    std::atomic<uint64_t>       m_downloadGeneration{1};
 
     // Mutex for station state updates from download threads
     mutable std::mutex m_stationMutex;

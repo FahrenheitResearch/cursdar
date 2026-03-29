@@ -3,6 +3,7 @@
 #include <cstring>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #ifndef M_PI
@@ -43,6 +44,20 @@ static size_t    d_forwardAccumCapacity = 0;
 
 // Host-side pointer tracking
 static GpuStationPtrs h_stationPtrs[MAX_STATIONS] = {};
+
+static void initializeSpatialGrid(SpatialGrid* grid) {
+    if (!grid) return;
+
+    memset(grid, 0, sizeof(SpatialGrid));
+    grid->min_lat = 15.0f;
+    grid->max_lat = 72.0f;
+    grid->min_lon = -180.0f;
+    grid->max_lon = -60.0f;
+    for (int gy = 0; gy < SPATIAL_GRID_H; gy++)
+        for (int gx = 0; gx < SPATIAL_GRID_W; gx++)
+            for (int s = 0; s < MAX_STATIONS_PER_CELL; s++)
+                grid->cells[gy][gx][s] = -1;
+}
 
 // ── Color table generation ──────────────────────────────────
 
@@ -1107,16 +1122,7 @@ void buildSpatialGridGpu(const GpuStationInfo* h_stations, int num_stations,
                           SpatialGrid* h_grid_out) {
     if (!h_grid_out) return;
     if (num_stations <= 0 || !h_stations) {
-        SpatialGrid empty = {};
-        empty.min_lat = 15.0f;
-        empty.max_lat = 72.0f;
-        empty.min_lon = -180.0f;
-        empty.max_lon = -60.0f;
-        for (int gy = 0; gy < SPATIAL_GRID_H; gy++)
-            for (int gx = 0; gx < SPATIAL_GRID_W; gx++)
-                for (int s = 0; s < MAX_STATIONS_PER_CELL; s++)
-                    empty.cells[gy][gx][s] = -1;
-        *h_grid_out = empty;
+        initializeSpatialGrid(h_grid_out);
         return;
     }
 
@@ -1134,14 +1140,9 @@ void buildSpatialGridGpu(const GpuStationInfo* h_stations, int num_stations,
     CUDA_CHECK(cudaMemcpy(d_gridActiveBuf, h_active.data(), num_stations * sizeof(uint8_t),
                            cudaMemcpyHostToDevice));
 
-    SpatialGrid init_grid = {};
-    init_grid.min_lat = 15.0f;  init_grid.max_lat = 72.0f;
-    init_grid.min_lon = -180.0f; init_grid.max_lon = -60.0f;
-    for (int gy = 0; gy < SPATIAL_GRID_H; gy++)
-        for (int gx = 0; gx < SPATIAL_GRID_W; gx++)
-            for (int s = 0; s < MAX_STATIONS_PER_CELL; s++)
-                init_grid.cells[gy][gx][s] = -1;
-    CUDA_CHECK(cudaMemcpy(d_gridBuildBuf, &init_grid, sizeof(SpatialGrid), cudaMemcpyHostToDevice));
+    auto init_grid = std::make_unique<SpatialGrid>();
+    initializeSpatialGrid(init_grid.get());
+    CUDA_CHECK(cudaMemcpy(d_gridBuildBuf, init_grid.get(), sizeof(SpatialGrid), cudaMemcpyHostToDevice));
 
     buildGridKernel<<<(num_stations + 255) / 256, 256>>>(
         d_gridStationsBuf, d_gridActiveBuf, num_stations, d_gridBuildBuf);
